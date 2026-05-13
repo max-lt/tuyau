@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
