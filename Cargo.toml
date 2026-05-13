@@ -1,6 +1,50 @@
-[package]
-name = "tuyau"
+[workspace]
+resolver = "3"
+members = [
+    "crates/tuyau-protocol",
+    "crates/tuyau-server",
+    "crates/tuyau-client",
+    "crates/tuyau-cli",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
 
-[dependencies]
+[workspace.dependencies]
+# QUIC + TLS
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rcgen = "0.13"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+toml = "0.8"
+hex = "0.4"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Crypto utility
+subtle = "2"
+rand = "0.8"
+
+# Internal crates
+tuyau-protocol = { path = "crates/tuyau-protocol" }
+tuyau-server = { path = "crates/tuyau-server" }
+tuyau-client = { path = "crates/tuyau-client" }

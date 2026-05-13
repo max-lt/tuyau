@@ -1,1 +1,13 @@
 /target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Cert/key material — never commit
+*.pem
+*.key
