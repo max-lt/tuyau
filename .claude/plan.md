@@ -31,10 +31,8 @@ Single TOML file per side. No external files needed in default mode.
 
 ```toml
 listen_addr = "0.0.0.0:4433"
-
-[tunnel_cert]
-mode = "auto"  # generate self-signed cert on first run, persist next to config
-# Alternatives: mode = "inline" with cert_pem/key_pem, or mode = "files" with paths
+# tunnel_cert_dir = "/var/lib/tuyau"   # optional; defaults to the directory of the --config file
+# Auto-generated tunnel-cert.pem + tunnel-key.pem live there.
 
 [[clients]]
 name = "service-a"
@@ -96,7 +94,7 @@ tuyau/
 │   ├── tuyau-server/      QUIC listener + token validation
 │   ├── tuyau-client/      QUIC dialer + token send
 │   └── tuyau-cli/         Binary `tuyau` with `server` and `client` subcommands
-└── tests/
+└── crates/tuyau-cli/tests/
     └── integration.rs     End-to-end handshake test
 ```
 
@@ -106,29 +104,21 @@ Two frames, exchanged on the first bidi stream of the QUIC connection:
 
 ```rust
 pub struct Hello {
-    pub token: String,
-    pub client_name: String,    // informational, for server logs
-    pub client_version: String, // e.g. "tuyau-client/0.1.0"
+    pub token: [u8; 32],     // raw bytes on the wire; hex in TOML
+    pub client_name: String, // informational, for server logs
 }
 
 pub enum HelloResponse {
-    Welcome {
-        server_version: String,
-    },
-    Reject {
-        reason: RejectReason,
-    },
-}
-
-pub enum RejectReason {
-    InvalidToken,
-    ProtocolError,
+    Welcome,
+    Reject { reason: String }, // free-form, server-controlled, debug-friendly
 }
 ```
 
 Encoding: each frame is a u32 big-endian length prefix followed by ciborium-encoded CBOR. Max frame size 64 KiB (this is a tiny handshake).
 
-After Welcome: connection stays open (server holds it; future iterations will use it). Client logs "connected" and waits. The connection lifetime + heartbeat behavior is **explicitly out of scope** for the MVP — if the connection drops, both sides notice and exit. No reconnect.
+After Welcome: connection stays open (server holds it; future iterations will use it). Client logs "connected" and waits.
+
+**Connection liveness**: QUIC-level keep-alive only — no application heartbeat. Both sides set `keep_alive_interval = 15s` and `max_idle_timeout = 60s` on `quinn::TransportConfig`. If the connection drops (network failure, peer exit), both sides notice via QUIC and exit. No reconnect.
 
 ---
 
@@ -142,8 +132,8 @@ After Welcome: connection stays open (server holds it; future iterations will us
 - [ ] `[workspace.dependencies]` populated with all deps from the Tech Stack table
 - [ ] `LICENSE-MIT` and `LICENSE-APACHE` at the repo root
 - [ ] `README.md` with one paragraph + "status: pre-alpha"
-- [ ] `.github/workflows/ci.yml`: `cargo build --workspace`, `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `.gitignore` for Rust + editor artifacts + `*.local.toml` + `*.pem`
+- [ ] `.github/workflows/ci.yml`: matrix `os: [ubuntu-latest, macos-latest]` (macos-latest = Apple Silicon), running `cargo build --workspace`, `cargo test --workspace`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `.gitignore` for Rust + editor artifacts + `*.pem`
 
 **Test**: `cargo build --workspace` and `cargo test --workspace` succeed. CI green on a push.
 
@@ -153,7 +143,7 @@ After Welcome: connection stays open (server holds it; future iterations will us
 
 Frames + codec. No networking.
 
-- [ ] Define `Hello`, `HelloResponse`, `RejectReason` with serde derives
+- [ ] Define `Hello`, `HelloResponse` with serde derives
 - [ ] Define `FrameCodec<F>` impl `tokio_util::codec::Encoder<F>` and `Decoder<Item = F>` for any `F: Serialize + DeserializeOwned`:
   - 4-byte big-endian length prefix
   - Max frame 64 KiB (constant)
@@ -178,30 +168,25 @@ Server-side: listen, accept, read Hello, validate, respond.
   ```rust
   pub struct ServerConfig {
       pub listen_addr: SocketAddr,
-      pub tunnel_cert: TunnelCertConfig,
+      pub tunnel_cert_dir: Option<PathBuf>, // defaults to dir of --config file
       pub clients: Vec<ClientEntry>,
   }
-  pub struct ClientEntry { pub name: String, pub token: String }
-  pub enum TunnelCertConfig {
-      Auto { storage_dir: Option<PathBuf> },
-      Inline { cert_pem: String, key_pem: String },
-      Files { cert_path: PathBuf, key_path: PathBuf },
+  pub struct ClientEntry {
+      pub name: String,
+      pub token: [u8; 32], // 64-hex-chars in TOML, parsed via custom deserialize_with
   }
   ```
-- [ ] Cert handling per `TunnelCertConfig`:
-  - `Auto`: load `<storage_dir>/tunnel-cert.pem` + `tunnel-key.pem`; if missing, generate via `rcgen` (CN = "tuyau-tunnel", validity 10 years, EC P-256) and persist (key file with mode 0600 on Unix)
-  - `Inline`: parse PEM strings from config
-  - `Files`: read from disk
+- [ ] Cert handling: load `<tunnel_cert_dir>/tunnel-cert.pem` + `tunnel-key.pem`; if missing, generate via `rcgen` (CN = "tuyau-tunnel", validity 10 years, EC P-256) and persist (key file with mode 0600 on Unix)
 - [ ] Compute SHA-256 fingerprint of the cert DER, log at INFO at startup so it can be copied into a client config
-- [ ] Build quinn server config with rustls, ALPN = `tuyau/0`, bound to `listen_addr`
+- [ ] Build quinn server config with rustls, ALPN = `tuyau/0`, bound to `listen_addr`. Set `TransportConfig::keep_alive_interval = Some(15s)` and `max_idle_timeout = Some(60s)`.
 - [ ] Accept loop: per incoming connection, spawn a task that:
   1. Awaits `connection.accept_bi()` for the first bidirectional stream (5s timeout)
   2. Wraps the recv half in `FrameCodec<Hello>` and send half in `FrameCodec<HelloResponse>`
   3. Reads exactly one `Hello` frame
-  4. Validates `hello.token` against `config.clients[].token` using `subtle::ConstantTimeEq`
+  4. Validates `hello.token` (`[u8; 32]`) against `config.clients[].token` using `subtle::ConstantTimeEq`
   5. On match: logs `INFO "client connected" name=<matched_name>`, sends `HelloResponse::Welcome`, holds the connection open
-  6. On no match: sends `HelloResponse::Reject { InvalidToken }`, closes
-  7. On bad frame / timeout: sends `Reject { ProtocolError }`, closes
+  6. On no match: sends `HelloResponse::Reject { reason: "invalid token" }`, closes
+  7. On bad frame / timeout: sends `Reject { reason: "protocol error" }`, closes
 - [ ] Public API: `TunnelServer::start(config: ServerConfig) -> Result<TunnelServer>` returning a handle. `TunnelServer::shutdown()` closes the endpoint gracefully.
 
 **Tests** (in `crates/tuyau-server/tests/`):
@@ -210,8 +195,8 @@ Server-side: listen, accept, read Hello, validate, respond.
 - [ ] Send Hello with wrong token → receive `Reject { InvalidToken }`
 - [ ] Send malformed bytes on the stream → receive `Reject { ProtocolError }` (or connection closes)
 - [ ] Don't send anything → connection closed by server after 5s timeout
-- [ ] `Auto` cert mode: start server twice with the same `storage_dir`, fingerprint stable
-- [ ] `Inline` cert mode: start server with PEM strings, verify it accepts a connection
+- [ ] Start server twice with the same `tunnel_cert_dir`, fingerprint stable across runs
+- [ ] Connect with a wrong ALPN → rustls rejects the handshake
 - [ ] `cargo test -p tuyau-server` passes
 
 ---
@@ -224,8 +209,8 @@ Client-side: connect, send Hello, read response.
   ```rust
   pub struct ClientConfig {
       pub server_addr: String,                       // host:port
-      pub server_cert_fingerprint_sha256: [u8; 32],  // pinned cert fingerprint
-      pub token: String,
+      pub server_cert_fingerprint_sha256: [u8; 32],  // 64 hex chars in TOML → [u8; 32] via custom deserialize_with
+      pub token: [u8; 32],                            // same hex → [u8; 32] custom deserializer
       pub client_name: String,
   }
   ```
@@ -233,13 +218,13 @@ Client-side: connect, send Hello, read response.
   - Computes SHA-256 of the leaf cert DER
   - Compares to `server_cert_fingerprint_sha256` with constant-time compare
   - Returns Ok if match, error otherwise (no PKI chain validation)
-- [ ] ALPN = `tuyau/0`
+- [ ] ALPN = `tuyau/0`. Set `TransportConfig::keep_alive_interval = Some(15s)` and `max_idle_timeout = Some(60s)`.
 - [ ] Resolve `server_addr` (DNS), dial, complete TLS
 - [ ] Open first bidi stream
-- [ ] Send `Hello { token, client_name, client_version }`
+- [ ] Send `Hello { token, client_name }`
 - [ ] Read `HelloResponse` (5s timeout)
 - [ ] On `Welcome`: log INFO "connected", hold the connection. Stay alive until the connection closes (peer-initiated or local Ctrl-C).
-- [ ] On `Reject { reason }`: log error, exit non-zero with a distinct exit code per reason
+- [ ] On `Reject { reason }`: log the reason, exit non-zero
 - [ ] On any other error: log, exit non-zero
 - [ ] Public API: `TunnelClient::connect(config: ClientConfig) -> Result<TunnelClient>` returning a handle that resolves when the connection ends. `TunnelClient::shutdown()` for graceful close.
 
@@ -260,9 +245,8 @@ Tie it together into a runnable binary.
   ```
   tuyau server --config <PATH>
   tuyau client --config <PATH>
-  tuyau gen-token              # prints 32 random bytes hex to stdout
-  tuyau show-fingerprint <PATH-TO-CERT>
   ```
+  Token bootstrap: `openssl rand -hex 32` (documented in README). Fingerprint bootstrap: server logs it at startup (M2). No utility subcommands in the MVP.
 - [ ] Load TOML config via serde, fail-fast on validation errors with clear messages (which field, what's wrong)
 - [ ] `tracing-subscriber` setup with `RUST_LOG` env-filter, default `info`
 - [ ] On SIGINT/SIGTERM: call `shutdown()` on the running component, wait up to 2s, exit
@@ -273,8 +257,7 @@ Tie it together into a runnable binary.
 
 **Tests** (in `tests/integration.rs`):
 - [ ] Parse a sample server.toml and client.toml; verify config struct matches expectations
-- [ ] Reject a config with empty `clients` list; reject a config with empty `token`; reject malformed fingerprint hex
-- [ ] `tuyau gen-token` outputs exactly 64 hex chars + newline, exit 0
+- [ ] Reject a config with empty `clients` list; reject malformed token (not 64 hex chars); reject malformed fingerprint hex
 - [ ] **End-to-end smoke test**: in-process, launch `TunnelServer` + `TunnelClient` with matching token, verify they handshake successfully and both log "connected"
 
 **MVP success criterion**: this end-to-end smoke test passes in CI on every push.
