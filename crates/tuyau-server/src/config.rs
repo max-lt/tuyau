@@ -4,11 +4,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
 
+pub use tuyau_protocol::TlsMode;
+
 use crate::error::ConfigError;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
+    #[serde(default)]
+    pub public_listen_addr: Option<SocketAddr>,
     pub tunnel_cert_dir: Option<PathBuf>,
     pub clients: Vec<ClientEntry>,
     #[serde(default)]
@@ -28,14 +32,6 @@ pub struct HostnameEntry {
     pub client: String,
     #[serde(default)]
     pub tls_mode: TlsMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TlsMode {
-    #[default]
-    Terminated,
-    Passthrough,
 }
 
 impl ServerConfig {

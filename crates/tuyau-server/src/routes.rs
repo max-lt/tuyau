@@ -5,12 +5,7 @@ use crate::config::TlsMode;
 
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
-    // `client_name` and `tls_mode` are populated for M5a but only consumed
-    // starting M5b (public listener / dispatch). Keep them readable now so the
-    // table is feature-complete at write time.
-    #[allow(dead_code)]
     pub client_name: String,
-    #[allow(dead_code)]
     pub tls_mode: TlsMode,
     pub conn: quinn::Connection,
 }
@@ -79,5 +74,13 @@ impl RoutingTable {
         let mut hosts: Vec<String> = guard.keys().cloned().collect();
         hosts.sort();
         hosts
+    }
+
+    /// Clone of the route entry for `host`, if any. Used by the public listener
+    /// to find the tunnel connection responsible for an incoming public TLS
+    /// connection.
+    pub fn lookup(&self, host: &str) -> Option<RouteEntry> {
+        let guard = self.inner.read().expect("routes lock poisoned");
+        guard.get(host).cloned()
     }
 }

@@ -6,16 +6,30 @@ use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicCli
 use rustls::ClientConfig as RustlsClientConfig;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use tuyau_protocol::{ALPN, FrameCodec, Hello, HelloResponse};
+use tuyau_protocol::{ALPN, DataStreamHeader, FrameCodec, Hello, HelloResponse};
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
 use crate::verifier::PinningCertVerifier;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 const MAX_IDLE: Duration = Duration::from_secs(60);
+
+/// An accepted server-initiated bidi stream, with its `DataStreamHeader` read
+/// and the raw quinn streams ready for byte-level forwarding.
+///
+/// Note: this leaks `quinn::*` types deliberately — it's the "layer 3 / raw"
+/// surface of the lib-first API. M5d will add `quinn`-free wrappers
+/// (`tokio::io::AsyncRead`/`Listener` adapters) on top.
+#[derive(Debug)]
+pub struct TunnelStream {
+    pub header: DataStreamHeader,
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
+}
 
 #[derive(Debug)]
 pub struct TunnelClient {
@@ -107,6 +121,28 @@ impl TunnelClient {
 
     pub async fn wait_closed(&self) -> quinn::ConnectionError {
         self.connection.closed().await
+    }
+
+    /// Wait for the next server-initiated bidi stream and read its
+    /// `DataStreamHeader` (first frame). Returns the header plus the raw
+    /// stream halves for byte-level forwarding.
+    ///
+    /// In M5b this is the testing hook the public listener writes through.
+    /// M5c will layer an internal accept loop + per-host forward to
+    /// `local_addr` on top of this primitive.
+    pub async fn accept_bi(&self) -> Result<TunnelStream, ClientError> {
+        let (send, recv) = self.connection.accept_bi().await?;
+        let mut reader = FramedRead::new(recv, FrameCodec::<DataStreamHeader>::new());
+
+        let header = match tokio::time::timeout(HEADER_TIMEOUT, reader.next()).await {
+            Ok(Some(Ok(h))) => h,
+            Ok(Some(Err(e))) => return Err(ClientError::Protocol(e)),
+            Ok(None) => return Err(ClientError::StreamClosedBeforeResponse),
+            Err(_) => return Err(ClientError::ResponseTimeout),
+        };
+
+        let recv = reader.into_inner();
+        Ok(TunnelStream { header, send, recv })
     }
 
     pub async fn shutdown(self) {

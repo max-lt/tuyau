@@ -11,6 +11,9 @@ use crate::error::CertError;
 const CERT_FILE: &str = "tunnel-cert.pem";
 const KEY_FILE: &str = "tunnel-key.pem";
 
+const PUBLIC_CERT_FILE: &str = "public-cert.pem";
+const PUBLIC_KEY_FILE: &str = "public-key.pem";
+
 pub struct CertMaterial {
     pub cert_der: CertificateDer<'static>,
     pub key_der: PrivateKeyDer<'static>,
@@ -75,6 +78,48 @@ fn generate(dir: &Path, cert_path: &Path, key_path: &Path) -> Result<CertMateria
 
     fs::write(cert_path, cert_pem.as_bytes())?;
     write_key_secure(key_path, key_pem.as_bytes())?;
+
+    let cert_der = cert.der().clone();
+    let key_der_bytes = key_pair.serialize_der();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der_bytes));
+    let fingerprint = sha256(&cert_der);
+
+    Ok(CertMaterial {
+        cert_der,
+        key_der,
+        fingerprint,
+    })
+}
+
+/// Generate a self-signed certificate covering all `hostnames` as SANs, for
+/// the public TLS listener. Regenerated on every server boot — this cert is
+/// not pinned by anyone, so churn is fine. ACME (M5e) will eventually replace
+/// this code path with real, browser-trusted certs.
+pub fn generate_public_cert(hostnames: &[String], dir: &Path) -> Result<CertMaterial, CertError> {
+    fs::create_dir_all(dir)?;
+
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    let san_list = if hostnames.is_empty() {
+        // Should not happen in practice (caller filters terminated hostnames
+        // before invoking), but rcgen rejects empty SAN lists, so guard.
+        vec!["tuyau-public".to_string()]
+    } else {
+        hostnames.to_vec()
+    };
+    let mut params = CertificateParams::new(san_list)?;
+    let mut dn = DistinguishedName::new();
+    let cn = hostnames
+        .first()
+        .map(String::as_str)
+        .unwrap_or("tuyau-public");
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    let cert = params.self_signed(&key_pair)?;
+
+    let cert_path = dir.join(PUBLIC_CERT_FILE);
+    let key_path = dir.join(PUBLIC_KEY_FILE);
+    fs::write(&cert_path, cert.pem().as_bytes())?;
+    write_key_secure(&key_path, key_pair.serialize_pem().as_bytes())?;
 
     let cert_der = cert.der().clone();
     let key_der_bytes = key_pair.serialize_der();

@@ -3,6 +3,7 @@
 mod cert;
 mod config;
 mod error;
+mod public;
 mod routes;
 mod server;
 

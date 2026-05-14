@@ -21,4 +21,5 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 tuyau-server = { workspace = true }
+tokio-rustls = { workspace = true }
 tempfile = { workspace = true }

@@ -13,6 +13,30 @@ pub enum HelloResponse {
     Reject { reason: String },
 }
 
+/// TLS handling for a given hostname.
+///
+/// - `Terminated`: the tuyau-server holds a cert for the hostname, terminates
+///   incoming TLS, and forwards the *plaintext* bytes over the tunnel.
+/// - `Passthrough`: the tuyau-server only peeks the SNI for routing and
+///   forwards the raw TLS bytes (including ClientHello) over the tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    #[default]
+    Terminated,
+    Passthrough,
+}
+
+/// First frame on each server-initiated data stream: tells the tunnel client
+/// which logical hostname this stream serves, the public peer's address (for
+/// logging / `X-Forwarded-For`), and which TLS mode the server applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataStreamHeader {
+    pub hostname: String,
+    pub peer_addr: String,
+    pub mode: TlsMode,
+}
+
 // Encode token as a CBOR byte string (major type 2) rather than an array
 // of 32 unsigned integers. Decoding accepts either form for robustness.
 mod token_serde {

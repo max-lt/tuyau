@@ -16,6 +16,7 @@ use tuyau_protocol::{ALPN, FrameCodec, Hello, HelloResponse};
 use crate::cert::{self, CertMaterial};
 use crate::config::{ClientEntry, ServerConfig, TlsMode};
 use crate::error::ServerError;
+use crate::public;
 use crate::routes::RoutingTable;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,8 +27,10 @@ pub struct TunnelServer {
     endpoint: Endpoint,
     fingerprint: [u8; 32],
     routes: RoutingTable,
+    public_addr: Option<SocketAddr>,
     cancel: CancellationToken,
     accept_handle: JoinHandle<()>,
+    public_handle: Option<JoinHandle<()>>,
 }
 
 impl TunnelServer {
@@ -54,6 +57,35 @@ impl TunnelServer {
 
         let cancel = CancellationToken::new();
         let routes = RoutingTable::new();
+
+        // Optional public listener — only spawned if configured. Generates a
+        // fresh multi-SAN self-signed cert per startup over the configured
+        // terminated hostnames. M5e will replace this with ACME-issued certs.
+        let (public_addr, public_handle) = match config.public_listen_addr {
+            Some(addr) => {
+                let terminated_hostnames: Vec<String> = config
+                    .hostnames
+                    .iter()
+                    .filter(|h| h.tls_mode == TlsMode::Terminated)
+                    .map(|h| h.host.clone())
+                    .collect();
+                let public_cert = cert::generate_public_cert(&terminated_hostnames, &cert_dir)?;
+                let handle = public::start(addr, public_cert, routes.clone(), cancel.clone())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, listen_addr = %addr, "public listener bind failed");
+                        e
+                    })?;
+                tracing::info!(
+                    listen_addr = %handle.local_addr,
+                    hostnames = terminated_hostnames.len(),
+                    "public TLS listener active"
+                );
+                (Some(handle.local_addr), Some(handle.join))
+            }
+            None => (None, None),
+        };
+
         let config = Arc::new(config);
         let endpoint_clone = endpoint.clone();
         let routes_clone = routes.clone();
@@ -67,13 +99,21 @@ impl TunnelServer {
             endpoint,
             fingerprint,
             routes,
+            public_addr,
             cancel,
             accept_handle,
+            public_handle,
         })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.endpoint.local_addr()
+    }
+
+    /// Address the public TLS listener is bound to, or `None` if the server
+    /// was configured without a `public_listen_addr`.
+    pub fn public_local_addr(&self) -> Option<SocketAddr> {
+        self.public_addr
     }
 
     pub fn cert_fingerprint(&self) -> [u8; 32] {
@@ -90,6 +130,9 @@ impl TunnelServer {
         self.cancel.cancel();
         self.endpoint.close(0u32.into(), b"server shutdown");
         let _ = self.accept_handle.await;
+        if let Some(h) = self.public_handle {
+            let _ = h.await;
+        }
         self.endpoint.wait_idle().await;
     }
 }

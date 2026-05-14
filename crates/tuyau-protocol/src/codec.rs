@@ -79,7 +79,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{Hello, HelloResponse};
+    use crate::frame::{DataStreamHeader, Hello, HelloResponse, TlsMode};
 
     fn sample_hello() -> Hello {
         Hello {
@@ -149,6 +149,34 @@ mod tests {
         let mut decoder = FrameCodec::<Hello>::new();
         let err = decoder.decode(&mut buf).unwrap_err();
         assert!(matches!(err, ProtocolError::OversizedFrame { .. }));
+    }
+
+    #[test]
+    fn data_stream_header_roundtrip_terminated() {
+        let header = DataStreamHeader {
+            hostname: "alpha.example.com".into(),
+            peer_addr: "10.0.0.1:54321".into(),
+            mode: TlsMode::Terminated,
+        };
+        let mut codec = FrameCodec::<DataStreamHeader>::new();
+        let mut buf = BytesMut::new();
+        codec.encode(header.clone(), &mut buf).unwrap();
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn data_stream_header_roundtrip_passthrough() {
+        let header = DataStreamHeader {
+            hostname: "secure.example.com".into(),
+            peer_addr: "2001:db8::1:443".into(),
+            mode: TlsMode::Passthrough,
+        };
+        let mut codec = FrameCodec::<DataStreamHeader>::new();
+        let mut buf = BytesMut::new();
+        codec.encode(header.clone(), &mut buf).unwrap();
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded, header);
     }
 
     #[test]
