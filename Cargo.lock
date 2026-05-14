@@ -1064,6 +1064,23 @@ version = "0.1.0"
 [[package]]
 name = "tuyau-client"
 version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hex",
+ "quinn",
+ "rustls",
+ "serde",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tuyau-protocol",
+ "tuyau-server",
+]
 
 [[package]]
 name = "tuyau-protocol"
