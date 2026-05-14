@@ -105,7 +105,7 @@ impl TunnelClient {
         }
     }
 
-    pub async fn wait_closed(self) -> quinn::ConnectionError {
+    pub async fn wait_closed(&self) -> quinn::ConnectionError {
         self.connection.closed().await
     }
 

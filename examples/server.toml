@@ -1,0 +1,18 @@
+# Sample tuyau server config.
+#
+# Run: tuyau server --config examples/server.toml
+#
+# On first boot the server generates a self-signed cert under tunnel_cert_dir
+# (defaults to this file's directory) and logs the SHA-256 fingerprint at INFO.
+# Copy that fingerprint into client.toml.
+
+listen_addr = "127.0.0.1:4433"
+
+# Where to persist tunnel-cert.pem + tunnel-key.pem. Optional.
+# tunnel_cert_dir = "/var/lib/tuyau"
+
+[[clients]]
+name = "service-a"
+# 32-byte token, 64 lowercase hex chars. Generate with:
+#   openssl rand -hex 32
+token = "0000000000000000000000000000000000000000000000000000000000000001"

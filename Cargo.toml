@@ -54,3 +54,4 @@ tempfile = "3"
 tuyau-protocol = { path = "crates/tuyau-protocol" }
 tuyau-server = { path = "crates/tuyau-server" }
 tuyau-client = { path = "crates/tuyau-client" }
+tuyau-cli = { path = "crates/tuyau-cli" }

@@ -1,0 +1,20 @@
+# Sample tuyau client config.
+#
+# Run: tuyau client --config examples/client.toml
+#
+# Bootstrap loop:
+# 1. Start the server once — it logs the cert SHA-256 fingerprint at INFO.
+# 2. Paste that fingerprint below.
+# 3. Make sure `token` matches one entry in server.toml's [[clients]].
+
+server_addr = "127.0.0.1:4433"
+
+# Pinned SHA-256 fingerprint of the server's self-signed cert (64 hex chars).
+# Printed by the server at startup. Replace this placeholder.
+server_cert_fingerprint_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Pre-shared token, 64 hex chars. Must match a [[clients]].token in server.toml.
+token = "0000000000000000000000000000000000000000000000000000000000000001"
+
+# Informational name for the server logs.
+client_name = "service-a"

@@ -9,3 +9,13 @@ name = "tuyau"
 path = "src/main.rs"
 
 [dependencies]
+tuyau-server = { workspace = true }
+tuyau-client = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
