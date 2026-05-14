@@ -17,11 +17,14 @@ rust-version = "1.85"
 # QUIC + TLS
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
 rcgen = "0.13"
+sha2 = "0.10"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "fs"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "fs", "sync"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +46,9 @@ anyhow = "1"
 # Crypto utility
 subtle = "2"
 rand = "0.8"
+
+# Test fixtures
+tempfile = "3"
 
 # Internal crates
 tuyau-protocol = { path = "crates/tuyau-protocol" }
