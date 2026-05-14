@@ -26,6 +26,7 @@ async fn spin_up_server() -> (TunnelServer, TempDir) {
             name: "service-a".into(),
             token: VALID_TOKEN,
         }],
+        hostnames: vec![],
     };
     let server = TunnelServer::start(config).await.unwrap();
     (server, dir)
@@ -223,6 +224,7 @@ async fn fingerprint_stable_across_restarts() {
             name: "a".into(),
             token: VALID_TOKEN,
         }],
+        hostnames: vec![],
     };
 
     let server1 = TunnelServer::start(cfg.clone()).await.unwrap();

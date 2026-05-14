@@ -31,6 +31,12 @@ pub enum ConfigError {
 
     #[error("parse error: {0}")]
     Parse(String),
+
+    #[error("duplicate hostname: {0}")]
+    DuplicateHost(String),
+
+    #[error("hostname '{host}' references unknown client '{client}'")]
+    UnknownClient { host: String, client: String },
 }
 
 #[derive(Debug, Error)]

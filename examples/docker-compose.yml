@@ -1,0 +1,31 @@
+# Demonstrates running tuyau client in Docker Compose with secret-file based
+# token delivery — the recommended pattern for containerised deployments.
+#
+# Bootstrap:
+#   1. On the server host, run `tuyau server --config examples/server.toml`
+#      once. The server logs the SHA-256 cert fingerprint at startup.
+#   2. Save the matching token (the same hex string as `clients[].token` in
+#      server.toml) into ./tuyau-token.hex.
+#   3. Replace the placeholder fingerprint below with the value from step 1.
+#   4. docker compose up
+#
+# The token never appears on the command line — only the secret-file path.
+
+services:
+  tuyau-client:
+    image: tuyau:latest # build locally for now: `docker build -t tuyau .`
+    command: ["client"]
+    environment:
+      TUYAU_SERVER: "tunnel.example.com:4433"
+      TUYAU_FINGERPRINT: "0000000000000000000000000000000000000000000000000000000000000000"
+      TUYAU_TOKEN_FILE: "/run/secrets/tuyau_token"
+      # TUYAU_NAME defaults to the container's hostname, which Docker sets to
+      # the short container ID. Override if you want a stable name in server logs.
+      # TUYAU_NAME: "my-service"
+    secrets:
+      - tuyau_token
+    restart: unless-stopped
+
+secrets:
+  tuyau_token:
+    file: ./tuyau-token.hex

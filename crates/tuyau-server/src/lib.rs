@@ -3,8 +3,9 @@
 mod cert;
 mod config;
 mod error;
+mod routes;
 mod server;
 
-pub use config::{ClientEntry, ServerConfig};
+pub use config::{ClientEntry, HostnameEntry, ServerConfig, TlsMode};
 pub use error::{CertError, ConfigError, ServerError};
 pub use server::TunnelServer;

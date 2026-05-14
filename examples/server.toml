@@ -4,7 +4,7 @@
 #
 # On first boot the server generates a self-signed cert under tunnel_cert_dir
 # (defaults to this file's directory) and logs the SHA-256 fingerprint at INFO.
-# Copy that fingerprint into client.toml.
+# Copy that fingerprint into client.toml or pass it as --fingerprint/TUYAU_FINGERPRINT.
 
 listen_addr = "127.0.0.1:4433"
 
@@ -16,3 +16,16 @@ name = "service-a"
 # 32-byte token, 64 lowercase hex chars. Generate with:
 #   openssl rand -hex 32
 token = "0000000000000000000000000000000000000000000000000000000000000001"
+
+# Hostname-to-client bindings. The server is the source of truth for which
+# client serves which hostname; the client never claims hostnames on the wire.
+# Both `terminated` (default) and `passthrough` are supported.
+[[hostnames]]
+host = "alpha.example.com"
+client = "service-a"
+# tls_mode = "terminated"
+
+[[hostnames]]
+host = "beta.example.com"
+client = "service-a"
+tls_mode = "passthrough"

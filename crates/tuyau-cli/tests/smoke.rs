@@ -1,10 +1,12 @@
 //! End-to-end smoke test: spin up TunnelServer + TunnelClient in-process and
-//! verify a successful handshake. This is the MVP success criterion.
+//! verify a successful handshake plus the M5a routing-table lifecycle.
+
+use std::time::Duration;
 
 use tempfile::TempDir;
 
 use tuyau_client::{ClientConfig, TunnelClient};
-use tuyau_server::{ClientEntry, ServerConfig, TunnelServer};
+use tuyau_server::{ClientEntry, HostnameEntry, ServerConfig, TlsMode, TunnelServer};
 
 const TOKEN: [u8; 32] = [0x42; 32];
 
@@ -19,11 +21,21 @@ async fn end_to_end_handshake() {
             name: "service-a".into(),
             token: TOKEN,
         }],
+        hostnames: vec![HostnameEntry {
+            host: "alpha.example.com".into(),
+            client: "service-a".into(),
+            tls_mode: TlsMode::Terminated,
+        }],
     };
 
     let server = TunnelServer::start(server_cfg).await.unwrap();
     let server_port = server.local_addr().unwrap().port();
     let fingerprint = server.cert_fingerprint();
+
+    assert!(
+        server.active_hostnames().is_empty(),
+        "routing table should be empty before any client connects"
+    );
 
     let client_cfg = ClientConfig {
         server_addr: format!("127.0.0.1:{server_port}"),
@@ -36,7 +48,26 @@ async fn end_to_end_handshake() {
         .await
         .expect("client should connect after a valid handshake");
 
+    assert_eq!(
+        server.active_hostnames(),
+        vec!["alpha.example.com".to_string()],
+        "routing table should be populated while the client is connected"
+    );
+
     client.shutdown().await;
+
+    // Server's cleanup runs asynchronously after observing conn.closed().
+    for _ in 0..50 {
+        if server.active_hostnames().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        server.active_hostnames().is_empty(),
+        "routing table should clear after the client disconnects"
+    );
+
     server.shutdown().await;
 }
 

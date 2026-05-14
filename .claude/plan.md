@@ -297,3 +297,148 @@ Everything beyond "client and server connect with a token." Out of scope, planne
 - Web UI / management API
 - Metrics / Prometheus
 
+---
+
+# Phase 2 — Public data plane (M5+)
+
+Phase 2 turns the QUIC tunnel from the MVP into a Cloudflare Tunnel-shaped reverse-proxy data plane: public listener on the server side, hostname-routed dispatch, forwarding to local services on the client side.
+
+## Architecture decisions locked at the start of Phase 2
+
+- **CF-style hostnames.** A client token = pure identity. The hostname-to-client binding lives entirely server-side, in `server.toml`'s top-level `[[hostnames]]` table. The client never claims or sends hostnames on the wire. Rationale: one source of truth, ergonomic for managed B2B, embed-friendly for the lib SDK use case.
+- **Client config is flag/env-first.** TOML is opt-in via `--config`. Designed for Docker/Compose/k8s: secrets through `--token-file` or `TUYAU_TOKEN_FILE`, never a bare `--token <hex>` (would leak in `ps` and shell history).
+- **Routing table is mutable at runtime in M5**, even if only populated from static config. Designed so M6 (dynamic config / hot reload / admin API) layers in without rework.
+- **Last-write-wins per matched client name.** A reconnecting client kicks its previous active connection. Smooth container restarts, no `max_idle_timeout` wait.
+
+## Milestone breakdown
+
+| Milestone | What it ships                                                          |
+| --------- | ---------------------------------------------------------------------- |
+| M5a       | Server `[[hostnames]]` config + routing table on connect/disconnect + client CLI/env layer. No public listener yet. |
+| M5b       | Public TCP/TLS listener + SNI/Host parsing + `DataStreamHeader` frame + dispatch QUIC stream. ALPN bumps to `tuyau/1`. |
+| M5c       | Client accept loop + `[[ingress]]` mapping + forward to `local_addr`. First end-to-end HTTP. |
+| M5d       | `axum::serve::Listener` adapter (lib-first API surface).               |
+| M5e       | ACME / Let's Encrypt cert issuance per hostname.                       |
+| M5f       | Passthrough TLS mode (SNI-only routing, no termination).               |
+
+---
+
+## M5a — Server hostname table + client CLI/env layer
+
+**Goal.** Restructure the server config to be the source of truth for hostnames, build an in-memory routing table populated at connect time, and switch the client to a flags/env-first config layer. M5b will consume the routing table.
+
+Wire protocol unchanged in M5a (ALPN still `tuyau/0`). Config + runtime plumbing only — no observable end-to-end behavior change yet.
+
+### Server config additions (`server.toml`)
+
+```toml
+listen_addr = "0.0.0.0:4433"
+
+[[clients]]
+name = "service-a"
+token = "<64 hex>"
+
+[[hostnames]]
+host = "alpha.example.com"
+client = "service-a"
+# tls_mode = "terminated"   # default; alt: "passthrough"
+```
+
+- [ ] Add top-level `hostnames: Vec<HostnameEntry>` parsed from `[[hostnames]]`
+- [ ] `HostnameEntry { host: String, client: String, tls_mode: TlsMode }`
+- [ ] `enum TlsMode { Terminated, Passthrough }` with `#[serde(rename_all = "snake_case")]`; default `Terminated`
+- [ ] Validation: no duplicate `host` across `[[hostnames]]`
+- [ ] Validation: every `[[hostnames]].client` references an existing `[[clients]].name`
+- [ ] A `[[clients]]` entry with zero matching `[[hostnames]]` is permitted (client connects, no hostnames activate)
+
+### Server runtime — routing table
+
+- [ ] New module `tuyau-server/src/routes.rs`:
+  ```rust
+  pub struct RouteEntry {
+      pub client_name: String,
+      pub tls_mode: TlsMode,
+      pub conn: quinn::Connection,
+  }
+  pub struct RoutingTable {
+      inner: Arc<RwLock<HashMap<String /*host*/, RouteEntry>>>,
+  }
+  ```
+- [ ] On successful Hello (token validated → matched client name resolved):
+  - Compute the set of hosts this client owns by config (filter `hostnames[]` by `client == matched_name`)
+  - If any of those hosts currently have a `RouteEntry` owned by a *different* `quinn::Connection` with the *same* matched name, close that previous connection (last-write-wins), wait briefly for cleanup
+  - Insert/replace all `(host → RouteEntry { client_name, tls_mode, conn })` for the new connection
+  - Log `INFO "client connected" name=... hosts=[...]`
+- [ ] On connection close (any reason): remove every routing-table entry whose `conn.stable_id()` matches this connection
+- [ ] Public API: `TunnelServer::active_hostnames() -> Vec<String>` (sorted) for tests/observability
+
+### Client config layer (`tuyau-cli`)
+
+CLI: `tuyau client [flags...]` OR `tuyau client --config <path>`. Mutually exclusive.
+
+- [ ] Flags: `--server <addr>`, `--fingerprint <hex>`, `--token-file <path>`, `--name <s>`, `--config <path>`
+- [ ] Env vars: `TUYAU_SERVER`, `TUYAU_FINGERPRINT`, `TUYAU_TOKEN` (hex), `TUYAU_TOKEN_FILE` (path), `TUYAU_NAME`
+- [ ] Resolution per field: flag > env > error (or default for `name`)
+- [ ] Token resolution priority: `--token-file` → `TUYAU_TOKEN_FILE` → `TUYAU_TOKEN`. File contents trimmed of trailing whitespace, parsed as 64 hex chars.
+- [ ] `--config <path>` is mutually exclusive with `--server`, `--fingerprint`, `--token-file`, `--name`: any combination is a hard error (clap-level `conflicts_with`)
+- [ ] Default `client_name` = `hostname::get()` (add `hostname = "0.4"` to workspace deps); fallback `"unknown"` if the call errors
+- [ ] Update `examples/client.toml` (still works for `--config` path) and add `examples/docker-compose.yml` demonstrating env + secret-file usage
+
+### Tests
+
+`tuyau-server`:
+- [ ] `from_toml_str` parses a config with top-level `[[hostnames]]`
+- [ ] Rejects duplicate `host` across `[[hostnames]]`
+- [ ] Rejects `[[hostnames]].client` referencing a non-existent `[[clients]].name`
+- [ ] `tls_mode` defaults to `Terminated` when omitted
+- [ ] Client connects with valid token → `active_hostnames()` returns the sorted set of its assigned hosts
+- [ ] Client disconnects cleanly → `active_hostnames()` no longer includes them
+- [ ] Last-write-wins: connection A established; same matched name reconnects as B; A is closed, B owns the routes. `active_hostnames()` reflects this within ~1s.
+- [ ] Client whose token has zero `[[hostnames]]` entries connects successfully; `active_hostnames()` unchanged
+
+`tuyau-cli`:
+- [ ] `--config` + any other config flag → clap conflict error
+- [ ] Flags-only invocation with all required fields → builds a valid `ClientConfig`
+- [ ] Env-only invocation with all required fields → builds the same `ClientConfig`
+- [ ] Flag overrides env when both are set
+- [ ] Missing token (no flag, no env) → error message names the field
+- [ ] `--token-file` reads from disk; trailing whitespace stripped
+- [ ] Default `client_name` matches `hostname::get()` when not specified
+
+`tuyau-cli` smoke (`tests/smoke.rs`):
+- [ ] Updated server config carries at least one `[[hostnames]]` entry pointing at the test client; the smoke asserts `active_hostnames()` is empty before connect, populated during, empty after shutdown
+
+### Out of scope for M5a (deferred)
+
+- Public TCP/TLS listener (M5b)
+- `DataStreamHeader` frame, ALPN bump to `tuyau/1` (M5b)
+- Client `[[ingress]]` config / accept loop / forward (M5c)
+- Wildcards in `host` (M6 or later)
+- Dynamic config (hot reload, admin API) — see M6 sketch below
+
+### Acceptance
+
+- [ ] All M5a tests pass
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [ ] `cargo fmt --all` clean
+- [ ] Commit: `M5a: server hostname routing table + client CLI/env config layer`
+
+---
+
+## M6 sketch — dynamic config (post-M5, not yet committed)
+
+Once Phase 2 ships, the natural extension is managing hostnames without bouncing the server. Sketched here because M5 design choices anticipate it.
+
+| Milestone | Idea                                                                                                |
+| --------- | --------------------------------------------------------------------------------------------------- |
+| M6a       | **Hot reload via SIGHUP / file-watch.** Server diffs on-disk TOML against the in-memory routing table; applies adds/removes; existing connections kept. Cheapest dynamic story; matches how IaC tools (Ansible/Terraform) write TOML. |
+| M6b       | **Local admin HTTP API.** Second listener on `127.0.0.1:9000` with REST endpoints for hostname CRUD; auth via shared secret. Persistence still in TOML (API writes back to disk). Door opener for a `tuyau ctl` CLI and a dashboard. |
+| M6c       | **Pluggable persistence.** `HostnameStore` trait with TOML / sqlite / postgres / redis backends. Required for multi-instance clustering (anycast / HA). |
+
+M5 decisions that keep M6 cheap:
+
+- Routing table is `Arc<RwLock<HashMap<...>>>` — mutable at runtime, not a constant built at boot.
+- Hostname entries will track their *origin* (TOML vs API vs DB) so reload doesn't clobber dynamic entries (added in M6b).
+- Client config layer is already flag/env/TOML-pluggable, so future credential sources (Vault, k8s downward API, GCP/AWS secret managers) are additive.
+- Last-write-wins reconnect semantics already handle the case where a managed control plane rotates tokens and clients reconnect with new credentials.
+

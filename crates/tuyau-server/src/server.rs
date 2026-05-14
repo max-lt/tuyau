@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 use tuyau_protocol::{ALPN, FrameCodec, Hello, HelloResponse};
 
 use crate::cert::{self, CertMaterial};
-use crate::config::{ClientEntry, ServerConfig};
+use crate::config::{ClientEntry, ServerConfig, TlsMode};
 use crate::error::ServerError;
+use crate::routes::RoutingTable;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -24,6 +25,7 @@ const MAX_IDLE: Duration = Duration::from_secs(60);
 pub struct TunnelServer {
     endpoint: Endpoint,
     fingerprint: [u8; 32],
+    routes: RoutingTable,
     cancel: CancellationToken,
     accept_handle: JoinHandle<()>,
 }
@@ -39,6 +41,7 @@ impl TunnelServer {
             fingerprint = %hex::encode(material.fingerprint),
             listen_addr = %config.listen_addr,
             clients = config.clients.len(),
+            hostnames = config.hostnames.len(),
             cert_dir = %cert_dir.display(),
             "starting tuyau-server"
         );
@@ -50,17 +53,20 @@ impl TunnelServer {
         let fingerprint = material.fingerprint;
 
         let cancel = CancellationToken::new();
+        let routes = RoutingTable::new();
         let config = Arc::new(config);
         let endpoint_clone = endpoint.clone();
+        let routes_clone = routes.clone();
         let cancel_clone = cancel.clone();
 
         let accept_handle = tokio::spawn(async move {
-            accept_loop(endpoint_clone, config, cancel_clone).await;
+            accept_loop(endpoint_clone, config, routes_clone, cancel_clone).await;
         });
 
         Ok(Self {
             endpoint,
             fingerprint,
+            routes,
             cancel,
             accept_handle,
         })
@@ -72,6 +78,12 @@ impl TunnelServer {
 
     pub fn cert_fingerprint(&self) -> [u8; 32] {
         self.fingerprint
+    }
+
+    /// Sorted snapshot of currently active hostnames (a hostname is "active"
+    /// while its owning client tunnel is connected).
+    pub fn active_hostnames(&self) -> Vec<String> {
+        self.routes.active_hostnames()
     }
 
     pub async fn shutdown(self) {
@@ -116,7 +128,12 @@ fn build_quinn_config(rustls_config: RustlsServerConfig) -> Result<QuinnServerCo
     Ok(server_config)
 }
 
-async fn accept_loop(endpoint: Endpoint, config: Arc<ServerConfig>, cancel: CancellationToken) {
+async fn accept_loop(
+    endpoint: Endpoint,
+    config: Arc<ServerConfig>,
+    routes: RoutingTable,
+    cancel: CancellationToken,
+) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -129,9 +146,10 @@ async fn accept_loop(endpoint: Endpoint, config: Arc<ServerConfig>, cancel: Canc
                     break;
                 };
                 let config = Arc::clone(&config);
+                let routes = routes.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_incoming(incoming, config, cancel).await {
+                    if let Err(e) = handle_incoming(incoming, config, routes, cancel).await {
                         tracing::warn!(error = %e, "connection handler error");
                     }
                 });
@@ -140,9 +158,18 @@ async fn accept_loop(endpoint: Endpoint, config: Arc<ServerConfig>, cancel: Canc
     }
 }
 
+/// Outcome of the handshake; determines whether routes were installed and
+/// therefore whether cleanup is needed after the connection ends.
+enum Outcome {
+    Welcome,
+    Reject,
+    NoResponse,
+}
+
 async fn handle_incoming(
     incoming: quinn::Incoming,
     config: Arc<ServerConfig>,
+    routes: RoutingTable,
     cancel: CancellationToken,
 ) -> Result<(), ServerError> {
     let connection = incoming.await?;
@@ -169,16 +196,42 @@ async fn handle_incoming(
 
     let hello_result = tokio::time::timeout(HELLO_TIMEOUT, reader.next()).await;
 
-    let response: Option<HelloResponse> = match hello_result {
+    let outcome = match hello_result {
         Ok(Some(Ok(hello))) => match match_token(&hello.token, &config.clients) {
-            Some(name) => {
+            Some(matched_name) => {
+                let assigned: Vec<(String, TlsMode)> = config
+                    .hostnames
+                    .iter()
+                    .filter(|h| h.client == matched_name)
+                    .map(|h| (h.host.clone(), h.tls_mode))
+                    .collect();
+
+                let host_list: Vec<&str> = assigned.iter().map(|(h, _)| h.as_str()).collect();
+
+                if let Some(prev) = routes.install(assigned.clone(), &matched_name, &connection) {
+                    tracing::info!(
+                        name = %matched_name,
+                        "kicking previous connection (last-write-wins)"
+                    );
+                    prev.close(0u32.into(), b"replaced by new connection");
+                }
+
                 tracing::info!(
                     peer = %peer,
-                    name = %name,
+                    name = %matched_name,
                     client_name = %hello.client_name,
+                    hosts = ?host_list,
                     "client connected"
                 );
-                Some(HelloResponse::Welcome)
+
+                match writer.send(HelloResponse::Welcome).await {
+                    Ok(()) => Outcome::Welcome,
+                    Err(e) => {
+                        tracing::warn!(peer = %peer, error = %e, "failed to send welcome");
+                        routes.remove_conn(connection.stable_id());
+                        return Ok(());
+                    }
+                }
             }
             None => {
                 tracing::warn!(
@@ -186,36 +239,39 @@ async fn handle_incoming(
                     client_name = %hello.client_name,
                     "client rejected: invalid token"
                 );
-                Some(HelloResponse::Reject {
-                    reason: "invalid token".into(),
-                })
+                let _ = writer
+                    .send(HelloResponse::Reject {
+                        reason: "invalid token".into(),
+                    })
+                    .await;
+                Outcome::Reject
             }
         },
         Ok(Some(Err(e))) => {
             tracing::warn!(peer = %peer, error = %e, "hello decode failed");
-            Some(HelloResponse::Reject {
-                reason: "protocol error".into(),
-            })
+            let _ = writer
+                .send(HelloResponse::Reject {
+                    reason: "protocol error".into(),
+                })
+                .await;
+            Outcome::Reject
         }
         Ok(None) => {
             tracing::warn!(peer = %peer, "stream closed before hello");
-            None
+            Outcome::NoResponse
         }
         Err(_) => {
             tracing::warn!(peer = %peer, "timed out waiting for hello frame");
-            Some(HelloResponse::Reject {
-                reason: "protocol error".into(),
-            })
+            let _ = writer
+                .send(HelloResponse::Reject {
+                    reason: "protocol error".into(),
+                })
+                .await;
+            Outcome::Reject
         }
     };
 
-    let Some(response) = response else {
-        return Ok(());
-    };
-
-    let send_result = writer.send(response).await;
-    if let Err(e) = send_result {
-        tracing::warn!(peer = %peer, error = %e, "failed to send response");
+    if matches!(outcome, Outcome::NoResponse) {
         return Ok(());
     }
 
@@ -223,8 +279,9 @@ async fn handle_incoming(
     let mut send = writer.into_inner();
     let _ = send.finish();
 
-    // Hold the connection open until the peer closes it or we cancel. Safety-net
-    // via the QUIC idle timeout (max_idle_timeout) if the peer abandons silently.
+    // Hold the connection open until the peer closes it or we cancel. The QUIC
+    // idle timeout (max_idle_timeout) is the safety-net if the peer abandons.
+    let stable_id = connection.stable_id();
     tokio::select! {
         _ = cancel.cancelled() => {
             connection.close(0u32.into(), b"server shutdown");
@@ -232,6 +289,10 @@ async fn handle_incoming(
         _ = connection.closed() => {
             tracing::debug!(peer = %peer, "connection closed by peer");
         }
+    }
+
+    if matches!(outcome, Outcome::Welcome) {
+        routes.remove_conn(stable_id);
     }
 
     Ok(())
