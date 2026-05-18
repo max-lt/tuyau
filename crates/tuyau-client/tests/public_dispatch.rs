@@ -1,5 +1,8 @@
-//! M5b end-to-end tests: public TLS client → tuyau-server's public listener →
-//! routed → tunnel client receives a `DataStreamHeader` + raw bytes.
+//! End-to-end data-plane tests:
+//! - M5b: public TLS → server listener → routed → tunnel client receives a
+//!   `DataStreamHeader` + raw bytes (via the raw `accept_bi` surface).
+//! - M5c: full HTTP request through `serve()` → ingress → local service →
+//!   response back out.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -37,11 +40,19 @@ async fn spin_up_with_public(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
 }
 
 async fn connect_tunnel(server: &TunnelServer) -> TunnelClient {
+    connect_tunnel_with(server, vec![]).await
+}
+
+async fn connect_tunnel_with(
+    server: &TunnelServer,
+    ingress: Vec<tuyau_client::IngressRule>,
+) -> TunnelClient {
     let cfg = ClientConfig {
         server_addr: format!("127.0.0.1:{}", server.local_addr().unwrap().port()),
         server_cert_fingerprint_sha256: server.cert_fingerprint(),
         token: TOKEN,
         client_name: "service-a".into(),
+        ingress,
     };
     TunnelClient::connect(cfg).await.unwrap()
 }
@@ -213,5 +224,98 @@ async fn public_tls_to_passthrough_is_dropped_in_m5b() {
     );
 
     tunnel_client.shutdown().await;
+    server.shutdown().await;
+}
+
+/// Minimal HTTP/1.1 server that replies with a fixed body and closes. Reads
+/// the request until the header terminator so split TCP segments don't break
+/// the test.
+async fn spawn_local_http(body: &'static str) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&tmp[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn end_to_end_http_request_through_tunnel() {
+    let local_addr = spawn_local_http("tuyau works").await;
+
+    let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
+        host: "alpha.example.com".into(),
+        client: "service-a".into(),
+        tls_mode: TlsMode::Terminated,
+    }])
+    .await;
+
+    let tunnel = connect_tunnel_with(
+        &server,
+        vec![tuyau_client::IngressRule {
+            host: "alpha.example.com".into(),
+            local_addr: local_addr.to_string(),
+        }],
+    )
+    .await;
+    let tunnel = Arc::new(tunnel);
+    let serve_client = Arc::clone(&tunnel);
+    let serve_handle = tokio::spawn(async move { serve_client.serve().await });
+
+    let public_addr = server.public_local_addr().unwrap();
+    let mut public = public_tls(public_addr, "alpha.example.com")
+        .await
+        .expect("public TLS handshake");
+
+    public
+        .write_all(b"GET / HTTP/1.1\r\nHost: alpha.example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), public.read_to_end(&mut raw))
+        .await
+        .expect("response should arrive within 5s")
+        .unwrap();
+    let resp = String::from_utf8_lossy(&raw);
+
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK"),
+        "expected 200, got: {resp:?}"
+    );
+    assert!(
+        resp.contains("tuyau works"),
+        "body missing in response: {resp:?}"
+    );
+
+    serve_handle.abort();
+    drop(public);
     server.shutdown().await;
 }

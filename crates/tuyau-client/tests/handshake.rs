@@ -62,6 +62,7 @@ fn client_config_for(
         server_cert_fingerprint_sha256: fingerprint,
         token,
         client_name: "alice".into(),
+        ingress: vec![],
     }
 }
 
@@ -121,6 +122,7 @@ async fn fails_on_unreachable_server() {
         server_cert_fingerprint_sha256: [0u8; 32],
         token: VALID_TOKEN,
         client_name: "alice".into(),
+        ingress: vec![],
     };
 
     let err = TunnelClient::connect(cfg).await.unwrap_err();

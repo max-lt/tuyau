@@ -1,12 +1,14 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use rustls::ClientConfig as RustlsClientConfig;
+use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use tuyau_protocol::{ALPN, DataStreamHeader, FrameCodec, Hello, HelloResponse};
+use tuyau_protocol::{ALPN, DataStreamHeader, FrameCodec, Hello, HelloResponse, read_frame};
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
@@ -35,6 +37,7 @@ pub struct TunnelStream {
 pub struct TunnelClient {
     connection: quinn::Connection,
     endpoint: Endpoint,
+    ingress: Arc<HashMap<String, String>>,
 }
 
 impl TunnelClient {
@@ -80,6 +83,13 @@ impl TunnelClient {
             Err(_) => return Err(ClientError::ConnectTimeout),
         };
 
+        let ingress: HashMap<String, String> = config
+            .ingress
+            .iter()
+            .map(|r| (r.host.clone(), r.local_addr.clone()))
+            .collect();
+        let ingress = Arc::new(ingress);
+
         let (send, recv) = connection.open_bi().await?;
         let mut writer = FramedWrite::new(send, FrameCodec::<Hello>::new());
         let mut reader = FramedRead::new(recv, FrameCodec::<HelloResponse>::new());
@@ -107,6 +117,7 @@ impl TunnelClient {
                 Ok(Self {
                     connection,
                     endpoint,
+                    ingress,
                 })
             }
             HelloResponse::Reject { reason } => {
@@ -131,24 +142,116 @@ impl TunnelClient {
     /// M5c will layer an internal accept loop + per-host forward to
     /// `local_addr` on top of this primitive.
     pub async fn accept_bi(&self) -> Result<TunnelStream, ClientError> {
-        let (send, recv) = self.connection.accept_bi().await?;
-        let mut reader = FramedRead::new(recv, FrameCodec::<DataStreamHeader>::new());
+        let (send, mut recv) = self.connection.accept_bi().await?;
 
-        let header = match tokio::time::timeout(HEADER_TIMEOUT, reader.next()).await {
-            Ok(Some(Ok(h))) => h,
-            Ok(Some(Err(e))) => return Err(ClientError::Protocol(e)),
-            Ok(None) => return Err(ClientError::StreamClosedBeforeResponse),
+        // Exact-length frame read: must NOT over-read into a buffer, since the
+        // same stream carries opaque request bytes right after the header.
+        let header = match tokio::time::timeout(
+            HEADER_TIMEOUT,
+            read_frame::<_, DataStreamHeader>(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => return Err(ClientError::Protocol(e)),
             Err(_) => return Err(ClientError::ResponseTimeout),
         };
 
-        let recv = reader.into_inner();
         Ok(TunnelStream { header, send, recv })
+    }
+
+    /// Run the ingress forward loop until the tunnel connection ends.
+    ///
+    /// Accepts server-initiated streams, looks each up in the configured
+    /// ingress map by hostname, dials the local service, and pipes bytes both
+    /// ways. Per-stream failures (no ingress rule, local service down, bad
+    /// header) are logged and the stream dropped — they do not stop the loop.
+    /// Returns `Ok(())` when the tunnel connection closes (any reason); no
+    /// reconnect is attempted (the orchestrator restarts the process).
+    pub async fn serve(&self) -> Result<(), ClientError> {
+        loop {
+            match self.accept_bi().await {
+                Ok(stream) => {
+                    let ingress = Arc::clone(&self.ingress);
+                    tokio::spawn(async move {
+                        forward_stream(stream, ingress).await;
+                    });
+                }
+                Err(ClientError::QuicConnection(e)) => {
+                    tracing::info!(error = %e, "tunnel connection closed, serve loop ending");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping malformed incoming stream");
+                    continue;
+                }
+            }
+        }
     }
 
     pub async fn shutdown(self) {
         self.connection.close(0u32.into(), b"client shutdown");
         self.endpoint.close(0u32.into(), b"client shutdown");
         self.endpoint.wait_idle().await;
+    }
+}
+
+async fn forward_stream(stream: TunnelStream, ingress: Arc<HashMap<String, String>>) {
+    let TunnelStream {
+        header,
+        mut send,
+        mut recv,
+    } = stream;
+
+    let Some(local_addr) = ingress.get(&header.hostname) else {
+        tracing::warn!(
+            hostname = %header.hostname,
+            "no ingress rule for hostname, dropping stream"
+        );
+        let _ = send.finish();
+        return;
+    };
+
+    let local = match tokio::net::TcpStream::connect(local_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                hostname = %header.hostname,
+                local_addr = %local_addr,
+                error = %e,
+                "failed to connect to local service, dropping stream"
+            );
+            let _ = send.finish();
+            return;
+        }
+    };
+
+    tracing::debug!(
+        hostname = %header.hostname,
+        local_addr = %local_addr,
+        peer = %header.peer_addr,
+        "forwarding stream to local service"
+    );
+
+    let (mut local_read, mut local_write) = local.into_split();
+
+    let inbound = async move {
+        let r = tokio::io::copy(&mut recv, &mut local_write).await;
+        let _ = local_write.shutdown().await;
+        r
+    };
+    let outbound = async move {
+        let r = tokio::io::copy(&mut local_read, &mut send).await;
+        let _ = send.finish();
+        r
+    };
+
+    let (in_res, out_res) = tokio::join!(inbound, outbound);
+    if let Err(e) = in_res {
+        tracing::debug!(error = %e, "public→local copy ended with error");
+    }
+    if let Err(e) = out_res {
+        tracing::debug!(error = %e, "local→public copy ended with error");
     }
 }
 

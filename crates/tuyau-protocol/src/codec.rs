@@ -1,12 +1,38 @@
 use std::marker::PhantomData;
 
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::{MAX_FRAME_SIZE, error::ProtocolError};
 
 const LEN_PREFIX_SIZE: usize = 4;
+
+/// Read exactly one length-delimited frame from `r` without consuming any
+/// bytes past it. Use this (not `FramedRead`) when the same stream carries a
+/// framed header followed by an opaque raw byte stream — `FramedRead` would
+/// buffer trailing bytes internally and `into_inner()` would drop them.
+pub async fn read_frame<R, F>(r: &mut R) -> Result<F, ProtocolError>
+where
+    R: AsyncRead + Unpin,
+    F: DeserializeOwned,
+{
+    let mut len_buf = [0u8; LEN_PREFIX_SIZE];
+    r.read_exact(&mut len_buf).await?;
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+
+    if frame_len > MAX_FRAME_SIZE {
+        return Err(ProtocolError::OversizedFrame {
+            len: frame_len,
+            max: MAX_FRAME_SIZE,
+        });
+    }
+
+    let mut payload = vec![0u8; frame_len];
+    r.read_exact(&mut payload).await?;
+    ciborium::from_reader(payload.as_slice()).map_err(ProtocolError::cbor)
+}
 
 #[derive(Debug, Default)]
 pub struct FrameCodec<F>(PhantomData<fn() -> F>);

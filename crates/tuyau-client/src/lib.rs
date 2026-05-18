@@ -6,5 +6,5 @@ mod error;
 mod verifier;
 
 pub use client::{TunnelClient, TunnelStream};
-pub use config::ClientConfig;
+pub use config::{ClientConfig, IngressRule};
 pub use error::{ClientError, ConfigError};

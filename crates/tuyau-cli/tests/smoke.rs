@@ -43,6 +43,7 @@ async fn end_to_end_handshake() {
         server_cert_fingerprint_sha256: fingerprint,
         token: TOKEN,
         client_name: "service-a".into(),
+        ingress: vec![],
     };
 
     let client = TunnelClient::connect(client_cfg)

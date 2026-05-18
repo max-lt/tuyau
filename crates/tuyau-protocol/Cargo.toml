@@ -8,4 +8,5 @@ license.workspace = true
 serde = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tokio-util = { workspace = true }

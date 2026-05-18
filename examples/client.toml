@@ -18,3 +18,10 @@ token = "0000000000000000000000000000000000000000000000000000000000000001"
 
 # Informational name for the server logs.
 client_name = "service-a"
+
+# Ingress: maps each public hostname (declared server-side in server.toml's
+# [[hostnames]]) to the local service to forward it to. Purely client-side —
+# never sent to the server.
+[[ingress]]
+host = "alpha.example.com"
+local_addr = "127.0.0.1:8080"

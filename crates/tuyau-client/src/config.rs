@@ -10,6 +10,16 @@ pub struct ClientConfig {
     #[serde(deserialize_with = "deserialize_hex_32")]
     pub token: [u8; 32],
     pub client_name: String,
+    /// Local forwarding rules: which public hostname maps to which local
+    /// `host:port`. Purely client-side — never sent to the server.
+    #[serde(default)]
+    pub ingress: Vec<IngressRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngressRule {
+    pub host: String,
+    pub local_addr: String,
 }
 
 impl ClientConfig {
@@ -52,6 +62,28 @@ mod tests {
         assert_eq!(cfg.server_cert_fingerprint_sha256[31], 0xaa);
         assert_eq!(cfg.token[31], 0xbb);
         assert_eq!(cfg.client_name, "service-a");
+        assert!(cfg.ingress.is_empty());
+    }
+
+    #[test]
+    fn parses_ingress_rules() {
+        let toml = r#"
+            server_addr = "tunnel.example.com:4433"
+            server_cert_fingerprint_sha256 = "00000000000000000000000000000000000000000000000000000000000000aa"
+            token = "00000000000000000000000000000000000000000000000000000000000000bb"
+            client_name = "service-a"
+            [[ingress]]
+            host = "alpha.example.com"
+            local_addr = "127.0.0.1:8080"
+            [[ingress]]
+            host = "beta.example.com"
+            local_addr = "127.0.0.1:9000"
+        "#;
+        let cfg = ClientConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.ingress.len(), 2);
+        assert_eq!(cfg.ingress[0].host, "alpha.example.com");
+        assert_eq!(cfg.ingress[0].local_addr, "127.0.0.1:8080");
+        assert_eq!(cfg.ingress[1].host, "beta.example.com");
     }
 
     #[test]

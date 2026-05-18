@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use tuyau_client::{ClientConfig, TunnelClient};
+use tuyau_client::{ClientConfig, IngressRule, TunnelClient};
 use tuyau_server::{ServerConfig, TunnelServer};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -35,7 +35,7 @@ enum Cmd {
 #[derive(clap::Args, Debug)]
 struct ClientArgs {
     /// Path to client.toml. Mutually exclusive with the per-field flags.
-    #[arg(long, conflicts_with_all = ["server", "fingerprint", "token_file", "name"])]
+    #[arg(long, conflicts_with_all = ["server", "fingerprint", "token_file", "name", "ingress"])]
     config: Option<PathBuf>,
 
     /// host:port of the tuyau-server. Env: TUYAU_SERVER.
@@ -56,6 +56,12 @@ struct ClientArgs {
     /// machine hostname. Env: TUYAU_NAME.
     #[arg(long)]
     name: Option<String>,
+
+    /// Ingress rule `host=local_addr`, repeatable. Maps a public hostname to
+    /// the local `host:port` to forward to. No env equivalent — use TOML
+    /// `[[ingress]]` for long lists.
+    #[arg(long = "ingress", value_name = "HOST=LOCAL_ADDR")]
+    ingress: Vec<String>,
 }
 
 #[tokio::main]
@@ -103,15 +109,18 @@ async fn run_client(args: ClientArgs) -> Result<()> {
     let client = TunnelClient::connect(cfg)
         .await
         .context("connecting to server")?;
-    tracing::info!("client connected, holding connection");
+    tracing::info!("client connected, serving ingress");
 
     tokio::select! {
         _ = wait_for_shutdown_signal() => {
             tracing::info!("shutting down");
             let _ = tokio::time::timeout(SHUTDOWN_GRACE, client.shutdown()).await;
         }
-        err = client.wait_closed() => {
-            tracing::info!(error = %err, "connection closed by remote");
+        res = client.serve() => {
+            match res {
+                Ok(()) => tracing::info!("tunnel closed"),
+                Err(e) => tracing::warn!(error = %e, "serve loop ended with error"),
+            }
         }
     }
 
@@ -172,12 +181,35 @@ fn build_client_config_inner(
 
     let client_name = args.name.or(env.name).unwrap_or_else(default_name);
 
+    let ingress = parse_ingress(&args.ingress)?;
+
     Ok(ClientConfig {
         server_addr,
         server_cert_fingerprint_sha256: fingerprint,
         token,
         client_name,
+        ingress,
     })
+}
+
+fn parse_ingress(entries: &[String]) -> Result<Vec<IngressRule>> {
+    entries
+        .iter()
+        .map(|e| {
+            let (host, local_addr) = e
+                .split_once('=')
+                .ok_or_else(|| anyhow!("invalid --ingress '{e}': expected HOST=LOCAL_ADDR"))?;
+            if host.is_empty() || local_addr.is_empty() {
+                return Err(anyhow!(
+                    "invalid --ingress '{e}': HOST and LOCAL_ADDR must both be non-empty"
+                ));
+            }
+            Ok(IngressRule {
+                host: host.to_string(),
+                local_addr: local_addr.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn resolve_token(
@@ -247,6 +279,7 @@ mod tests {
             fingerprint: None,
             token_file: None,
             name: None,
+            ingress: vec![],
         }
     }
 
@@ -302,6 +335,7 @@ mod tests {
             fingerprint: Some(HEX_A.into()),
             token_file: Some(tok.path().to_path_buf()),
             name: Some("explicit".into()),
+            ingress: vec![],
         };
         let cfg = build_client_config_inner(args, EnvVars::default(), stub_default_name).unwrap();
 
@@ -339,6 +373,7 @@ mod tests {
             fingerprint: Some(HEX_A.into()),
             token_file: None,
             name: Some("flag-name".into()),
+            ingress: vec![],
         };
         let env = EnvVars {
             server: Some("env:9999".into()),
@@ -431,5 +466,50 @@ mod tests {
     #[test]
     fn parse_hex_32_rejects_non_hex() {
         assert!(parse_hex_32(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn parse_ingress_single_and_multiple() {
+        let rules = parse_ingress(&[
+            "alpha.example.com=127.0.0.1:8080".to_string(),
+            "beta.example.com=10.0.0.2:9000".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].host, "alpha.example.com");
+        assert_eq!(rules[0].local_addr, "127.0.0.1:8080");
+        assert_eq!(rules[1].host, "beta.example.com");
+        assert_eq!(rules[1].local_addr, "10.0.0.2:9000");
+    }
+
+    #[test]
+    fn parse_ingress_rejects_missing_equals() {
+        let err = parse_ingress(&["alpha.example.com".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("HOST=LOCAL_ADDR"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ingress_rejects_empty_side() {
+        assert!(parse_ingress(&["=127.0.0.1:8080".to_string()]).is_err());
+        assert!(parse_ingress(&["alpha.example.com=".to_string()]).is_err());
+    }
+
+    #[test]
+    fn builds_ingress_from_flags() {
+        let mut tok = NamedTempFile::new().unwrap();
+        writeln!(tok, "{}", HEX_B).unwrap();
+
+        let args = ClientArgs {
+            config: None,
+            server: Some("host:4433".into()),
+            fingerprint: Some(HEX_A.into()),
+            token_file: Some(tok.path().to_path_buf()),
+            name: None,
+            ingress: vec!["alpha.example.com=127.0.0.1:8080".to_string()],
+        };
+        let cfg = build_client_config_inner(args, EnvVars::default(), stub_default_name).unwrap();
+        assert_eq!(cfg.ingress.len(), 1);
+        assert_eq!(cfg.ingress[0].host, "alpha.example.com");
+        assert_eq!(cfg.ingress[0].local_addr, "127.0.0.1:8080");
     }
 }

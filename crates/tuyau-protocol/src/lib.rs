@@ -4,7 +4,7 @@ mod codec;
 mod error;
 mod frame;
 
-pub use codec::FrameCodec;
+pub use codec::{FrameCodec, read_frame};
 pub use error::ProtocolError;
 pub use frame::{DataStreamHeader, Hello, HelloResponse, TlsMode};
 
