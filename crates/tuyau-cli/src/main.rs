@@ -183,16 +183,22 @@ fn build_client_config_inner(
 
     let ingress = parse_ingress(&args.ingress)?;
 
-    Ok(ClientConfig {
+    let cfg = ClientConfig {
         server_addr,
         server_cert_fingerprint_sha256: fingerprint,
         token,
         client_name,
         ingress,
-    })
+    };
+    cfg.validate()
+        .map_err(|e| anyhow!("invalid client config: {e}"))?;
+    Ok(cfg)
 }
 
 fn parse_ingress(entries: &[String]) -> Result<Vec<IngressRule>> {
+    // Only checks the `HOST=LOCAL_ADDR` split here; the per-rule shape (port
+    // numeric, non-empty host) is validated centrally in `ClientConfig::validate()`
+    // so the TOML path and the CLI path surface identical error messages.
     entries
         .iter()
         .map(|e| {

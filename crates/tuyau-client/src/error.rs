@@ -49,4 +49,7 @@ pub enum ClientError {
 pub enum ConfigError {
     #[error("parse error: {0}")]
     Parse(String),
+
+    #[error("ingress[{index}]: {reason}")]
+    InvalidIngress { index: usize, reason: String },
 }
