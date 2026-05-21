@@ -134,6 +134,16 @@ impl TunnelClient {
         self.connection.closed().await
     }
 
+    /// Owned listener-shaped view over the tunnel — the entry point for the
+    /// embedded / lib-first use case. Plug it into `axum::serve(listener,
+    /// router)` (with the `axum` feature) or drive `accept()` manually for
+    /// raw TCP-style services.
+    ///
+    /// Clones the underlying QUIC connection (cheap — internally an `Arc`).
+    pub fn listener(&self) -> crate::TunnelListener {
+        crate::TunnelListener::new(self.connection.clone())
+    }
+
     /// Wait for the next server-initiated bidi stream and read its
     /// `DataStreamHeader` (first frame). Returns the header plus the raw
     /// stream halves for byte-level forwarding.

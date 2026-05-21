@@ -3,6 +3,8 @@
 //!   `DataStreamHeader` + raw bytes (via the raw `accept_bi` surface).
 //! - M5c: full HTTP request through `serve()` → ingress → local service →
 //!   response back out.
+//! - M5d: `TunnelListener` / `TunnelConnection` (no quinn leak) and the
+//!   `axum::serve` adapter (behind the `axum` feature).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -312,6 +314,114 @@ async fn end_to_end_http_request_through_tunnel() {
     );
     assert!(
         resp.contains("tuyau works"),
+        "body missing in response: {resp:?}"
+    );
+
+    serve_handle.abort();
+    drop(public);
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// M5d: TunnelListener / TunnelConnection (no quinn leak)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tunnel_listener_yields_connection_with_metadata() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
+        host: "alpha.example.com".into(),
+        client: "service-a".into(),
+        tls_mode: TlsMode::Terminated,
+    }])
+    .await;
+
+    let tunnel = connect_tunnel(&server).await;
+    let listener = tunnel.listener();
+
+    let public_addr = server.public_local_addr().unwrap();
+    let mut public_stream = public_tls(public_addr, "alpha.example.com")
+        .await
+        .expect("public TLS handshake");
+
+    let (mut conn, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("accept must resolve within 5s")
+        .expect("accept must return Ok");
+
+    assert_eq!(conn.hostname(), "alpha.example.com");
+    assert_eq!(conn.tls_mode(), TlsMode::Terminated);
+    assert!(
+        peer.ip().is_loopback(),
+        "peer should be loopback, got {peer}"
+    );
+
+    // Bytes both directions through the no-quinn-leak wrapper.
+    public_stream.write_all(b"hello listener").await.unwrap();
+    let mut buf = [0u8; 32];
+    let n = conn.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello listener");
+
+    conn.write_all(b"world").await.unwrap();
+    conn.shutdown().await.unwrap();
+
+    let mut received = Vec::new();
+    public_stream.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, b"world");
+
+    drop(public_stream);
+    tunnel.shutdown().await;
+    server.shutdown().await;
+}
+
+#[cfg(feature = "axum")]
+#[tokio::test]
+async fn axum_serves_through_tunnel_listener() {
+    use axum::Router;
+    use axum::routing::get;
+
+    let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
+        host: "alpha.example.com".into(),
+        client: "service-a".into(),
+        tls_mode: TlsMode::Terminated,
+    }])
+    .await;
+
+    let tunnel = connect_tunnel(&server).await;
+    let listener = tunnel.listener();
+    let shutdown_signal = listener.closed();
+
+    let app = Router::new().route("/", get(|| async { "hello from axum-over-tuyau" }));
+    let serve_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .await;
+    });
+
+    let public_addr = server.public_local_addr().unwrap();
+    let mut public = public_tls(public_addr, "alpha.example.com")
+        .await
+        .expect("public TLS handshake");
+
+    public
+        .write_all(b"GET / HTTP/1.1\r\nHost: alpha.example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), public.read_to_end(&mut raw))
+        .await
+        .expect("axum response within 5s")
+        .unwrap();
+    let resp = String::from_utf8_lossy(&raw);
+
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK"),
+        "expected 200, got: {resp:?}"
+    );
+    assert!(
+        resp.contains("hello from axum-over-tuyau"),
         "body missing in response: {resp:?}"
     );
 
