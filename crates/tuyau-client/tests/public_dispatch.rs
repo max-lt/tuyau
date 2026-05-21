@@ -231,8 +231,9 @@ async fn public_tls_to_passthrough_is_dropped_in_m5b() {
 
 /// Minimal HTTP/1.1 server that replies with a fixed body and closes. Reads
 /// the request until the header terminator so split TCP segments don't break
-/// the test.
-async fn spawn_local_http(body: &'static str) -> SocketAddr {
+/// the test. Body is `Arc<Vec<u8>>` so callers can share large bodies cheaply
+/// across many connections.
+async fn spawn_local_http(body: Arc<Vec<u8>>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -240,6 +241,7 @@ async fn spawn_local_http(body: &'static str) -> SocketAddr {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
+            let body = body.clone();
             tokio::spawn(async move {
                 let mut req = Vec::new();
                 let mut tmp = [0u8; 1024];
@@ -254,12 +256,12 @@ async fn spawn_local_http(body: &'static str) -> SocketAddr {
                         }
                     }
                 }
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len(),
-                    body
                 );
-                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
                 let _ = sock.flush().await;
                 let _ = sock.shutdown().await;
             });
@@ -270,7 +272,7 @@ async fn spawn_local_http(body: &'static str) -> SocketAddr {
 
 #[tokio::test]
 async fn end_to_end_http_request_through_tunnel() {
-    let local_addr = spawn_local_http("tuyau works").await;
+    let local_addr = spawn_local_http(Arc::new(b"tuyau works".to_vec())).await;
 
     let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
         host: "alpha.example.com".into(),
@@ -427,5 +429,253 @@ async fn axum_serves_through_tunnel_listener() {
 
     serve_handle.abort();
     drop(public);
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-request / concurrent / large-payload coverage
+// ---------------------------------------------------------------------------
+
+/// Send one full HTTP/1.1 GET via TLS and return the raw response bytes.
+async fn http_get(public_addr: SocketAddr, sni: &str) -> Vec<u8> {
+    let mut public = public_tls(public_addr, sni).await.expect("TLS handshake");
+    let req = format!("GET / HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n");
+    public.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    public.read_to_end(&mut buf).await.unwrap();
+    buf
+}
+
+/// Strip the HTTP/1.1 header block and return only the body bytes.
+fn http_body(resp: &[u8]) -> &[u8] {
+    resp.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| &resp[i + 4..])
+        .unwrap_or(resp)
+}
+
+#[tokio::test]
+async fn serve_handles_multiple_sequential_requests() {
+    let local_addr = spawn_local_http(Arc::new(b"req-ok".to_vec())).await;
+    let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
+        host: "alpha.example.com".into(),
+        client: "service-a".into(),
+        tls_mode: TlsMode::Terminated,
+    }])
+    .await;
+
+    let tunnel = connect_tunnel_with(
+        &server,
+        vec![tuyau_client::IngressRule {
+            host: "alpha.example.com".into(),
+            local_addr: local_addr.to_string(),
+        }],
+    )
+    .await;
+    let tunnel = Arc::new(tunnel);
+    let serve_client = Arc::clone(&tunnel);
+    let serve_handle = tokio::spawn(async move { serve_client.serve().await });
+
+    let public_addr = server.public_local_addr().unwrap();
+    for i in 0..3 {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            http_get(public_addr, "alpha.example.com"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("request {i} timed out"));
+        assert!(
+            resp.starts_with(b"HTTP/1.1 200 OK"),
+            "request {i} non-200: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        assert_eq!(http_body(&resp), b"req-ok", "request {i} body mismatch");
+    }
+
+    serve_handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn serve_handles_concurrent_public_connections() {
+    let local_addr = spawn_local_http(Arc::new(b"concurrent".to_vec())).await;
+    let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
+        host: "alpha.example.com".into(),
+        client: "service-a".into(),
+        tls_mode: TlsMode::Terminated,
+    }])
+    .await;
+
+    let tunnel = connect_tunnel_with(
+        &server,
+        vec![tuyau_client::IngressRule {
+            host: "alpha.example.com".into(),
+            local_addr: local_addr.to_string(),
+        }],
+    )
+    .await;
+    let tunnel = Arc::new(tunnel);
+    let serve_client = Arc::clone(&tunnel);
+    let serve_handle = tokio::spawn(async move { serve_client.serve().await });
+
+    let public_addr = server.public_local_addr().unwrap();
+    let a = tokio::spawn(http_get(public_addr, "alpha.example.com"));
+    let b = tokio::spawn(http_get(public_addr, "alpha.example.com"));
+
+    let (ra, rb) = tokio::time::timeout(Duration::from_secs(5), async {
+        (a.await.unwrap(), b.await.unwrap())
+    })
+    .await
+    .expect("concurrent responses within 5s");
+
+    for (label, resp) in [("a", &ra), ("b", &rb)] {
+        assert!(
+            resp.starts_with(b"HTTP/1.1 200 OK"),
+            "{label} non-200: {:?}",
+            String::from_utf8_lossy(resp)
+        );
+        assert_eq!(http_body(resp), b"concurrent", "{label} body");
+    }
+
+    serve_handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn multi_client_routing_keeps_hostnames_isolated() {
+    // Two distinct clients, each owning a different hostname. Public requests
+    // for each hostname must reach only the owning client's local service.
+    const TOKEN_A: [u8; 32] = [0xA0; 32];
+    const TOKEN_B: [u8; 32] = [0xB0; 32];
+
+    let local_a = spawn_local_http(Arc::new(b"from-alpha".to_vec())).await;
+    let local_b = spawn_local_http(Arc::new(b"from-beta".to_vec())).await;
+
+    let dir = TempDir::new().unwrap();
+    let server_cfg = ServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+        tunnel_cert_dir: Some(dir.path().to_path_buf()),
+        clients: vec![
+            ClientEntry {
+                name: "alpha-srv".into(),
+                token: TOKEN_A,
+            },
+            ClientEntry {
+                name: "beta-srv".into(),
+                token: TOKEN_B,
+            },
+        ],
+        hostnames: vec![
+            HostnameEntry {
+                host: "alpha.example.com".into(),
+                client: "alpha-srv".into(),
+                tls_mode: TlsMode::Terminated,
+            },
+            HostnameEntry {
+                host: "beta.example.com".into(),
+                client: "beta-srv".into(),
+                tls_mode: TlsMode::Terminated,
+            },
+        ],
+    };
+    let server = TunnelServer::start(server_cfg).await.unwrap();
+
+    let make_client = |token: [u8; 32], host: &str, local: SocketAddr| {
+        let cfg = ClientConfig {
+            server_addr: format!("127.0.0.1:{}", server.local_addr().unwrap().port()),
+            server_cert_fingerprint_sha256: server.cert_fingerprint(),
+            token,
+            client_name: host.into(),
+            ingress: vec![tuyau_client::IngressRule {
+                host: host.into(),
+                local_addr: local.to_string(),
+            }],
+        };
+        async move { TunnelClient::connect(cfg).await.unwrap() }
+    };
+
+    let tunnel_a = Arc::new(make_client(TOKEN_A, "alpha.example.com", local_a).await);
+    let tunnel_b = Arc::new(make_client(TOKEN_B, "beta.example.com", local_b).await);
+
+    let a = Arc::clone(&tunnel_a);
+    let h_a = tokio::spawn(async move { a.serve().await });
+    let b = Arc::clone(&tunnel_b);
+    let h_b = tokio::spawn(async move { b.serve().await });
+
+    let public_addr = server.public_local_addr().unwrap();
+
+    let resp_a = tokio::time::timeout(
+        Duration::from_secs(5),
+        http_get(public_addr, "alpha.example.com"),
+    )
+    .await
+    .expect("alpha response within 5s");
+    let resp_b = tokio::time::timeout(
+        Duration::from_secs(5),
+        http_get(public_addr, "beta.example.com"),
+    )
+    .await
+    .expect("beta response within 5s");
+
+    assert_eq!(
+        http_body(&resp_a),
+        b"from-alpha",
+        "alpha must reach alpha-srv's local service, not beta's"
+    );
+    assert_eq!(
+        http_body(&resp_b),
+        b"from-beta",
+        "beta must reach beta-srv's local service, not alpha's"
+    );
+
+    h_a.abort();
+    h_b.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_payload_roundtrips_through_tunnel() {
+    // ~1 MiB body, deterministic pattern so we can compare exactly.
+    let body: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected = Arc::new(body);
+    let local_addr = spawn_local_http(Arc::clone(&expected)).await;
+
+    let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
+        host: "alpha.example.com".into(),
+        client: "service-a".into(),
+        tls_mode: TlsMode::Terminated,
+    }])
+    .await;
+
+    let tunnel = connect_tunnel_with(
+        &server,
+        vec![tuyau_client::IngressRule {
+            host: "alpha.example.com".into(),
+            local_addr: local_addr.to_string(),
+        }],
+    )
+    .await;
+    let tunnel = Arc::new(tunnel);
+    let serve_client = Arc::clone(&tunnel);
+    let serve_handle = tokio::spawn(async move { serve_client.serve().await });
+
+    let public_addr = server.public_local_addr().unwrap();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_get(public_addr, "alpha.example.com"),
+    )
+    .await
+    .expect("large response within 10s");
+
+    assert!(
+        resp.starts_with(b"HTTP/1.1 200 OK"),
+        "non-200 on large payload"
+    );
+    let body = http_body(&resp);
+    assert_eq!(body.len(), expected.len(), "body length mismatch");
+    assert_eq!(body, expected.as_slice(), "body content mismatch");
+
+    serve_handle.abort();
     server.shutdown().await;
 }

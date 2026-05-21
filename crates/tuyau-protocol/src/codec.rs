@@ -177,6 +177,32 @@ mod tests {
         assert!(matches!(err, ProtocolError::OversizedFrame { .. }));
     }
 
+    #[tokio::test]
+    async fn read_frame_rejects_bad_cbor_payload() {
+        use std::io::Cursor;
+        // Length prefix says 3 bytes; payload `[0xff, 0xff, 0xff]` is invalid CBOR.
+        let bytes = vec![0u8, 0, 0, 3, 0xff, 0xff, 0xff];
+        let mut r = Cursor::new(bytes);
+        let result: Result<Hello, _> = read_frame(&mut r).await;
+        assert!(
+            matches!(result, Err(ProtocolError::Cbor(_))),
+            "expected Cbor error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_length() {
+        use std::io::Cursor;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((MAX_FRAME_SIZE as u32) + 1).to_be_bytes());
+        let mut r = Cursor::new(bytes);
+        let result: Result<Hello, _> = read_frame(&mut r).await;
+        assert!(
+            matches!(result, Err(ProtocolError::OversizedFrame { .. })),
+            "expected OversizedFrame, got {result:?}"
+        );
+    }
+
     #[test]
     fn data_stream_header_roundtrip_terminated() {
         let header = DataStreamHeader {
