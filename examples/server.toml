@@ -6,9 +6,16 @@
 # (defaults to this file's directory) and logs the SHA-256 fingerprint at INFO.
 # Copy that fingerprint into client.toml or pass it as --fingerprint/TUYAU_FINGERPRINT.
 
-listen_addr = "127.0.0.1:4433"
+# QUIC tunnel listener — where authenticated tuyau-clients connect in.
+listen_addr = "0.0.0.0:4433"
 
-# Where to persist tunnel-cert.pem + tunnel-key.pem. Optional.
+# Public TLS listener — where the internet sends requests. Optional: if
+# unset, the server runs without a public data plane (useful for tests).
+# Use port 443 in prod; here we use a high port for local development.
+public_listen_addr = "0.0.0.0:8443"
+
+# Where to persist tunnel-cert.pem + tunnel-key.pem. Optional;
+# defaults to the directory of this config file.
 # tunnel_cert_dir = "/var/lib/tuyau"
 
 [[clients]]
