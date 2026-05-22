@@ -10,6 +10,7 @@ quinn = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
+rustls-acme = { workspace = true }
 rcgen = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

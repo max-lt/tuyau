@@ -17,6 +17,30 @@ pub struct ServerConfig {
     pub clients: Vec<ClientEntry>,
     #[serde(default)]
     pub hostnames: Vec<HostnameEntry>,
+    /// Optional ACME configuration. When set, the public listener uses
+    /// rustls-acme to fetch real browser-trusted certs via TLS-ALPN-01
+    /// instead of the dev-mode self-signed multi-SAN cert. Applies to
+    /// `terminated` hostnames only — passthrough never needs a cert.
+    #[serde(default)]
+    pub acme: Option<AcmeSection>,
+}
+
+/// ACME / Let's Encrypt parameters. The default `directory_url` points at LE
+/// **staging** (rate-limit-friendly, untrusted certs) — flip `production` to
+/// true for real Let's Encrypt certs. `contact` is the email the CA notifies
+/// for expiry / policy issues.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcmeSection {
+    /// `mailto:` URL the CA contacts on issues.
+    pub contact: String,
+    /// Directory where the ACME account key + cached certs are persisted
+    /// across restarts.
+    pub cache_dir: PathBuf,
+    /// If `true`, use the LE production directory. If `false` (default),
+    /// use LE staging — strongly recommended for first deployment so rate
+    /// limits don't bite during config iteration.
+    #[serde(default)]
+    pub production: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +83,12 @@ impl ServerConfig {
                     client: h.client.clone(),
                 });
             }
+        }
+
+        if let Some(acme) = &self.acme
+            && !acme.contact.starts_with("mailto:")
+        {
+            return Err(ConfigError::AcmeContact(acme.contact.clone()));
         }
 
         Ok(())
@@ -201,6 +231,42 @@ mod tests {
                 assert_eq!(client, "ghost");
             }
             other => panic!("expected UnknownClient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_acme_section() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:4433"
+            [[clients]]
+            name = "a"
+            token = "0000000000000000000000000000000000000000000000000000000000000001"
+            [acme]
+            contact = "mailto:ops@example.com"
+            cache_dir = "/var/lib/tuyau/acme"
+        "#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        cfg.validate().unwrap();
+        let acme = cfg.acme.unwrap();
+        assert_eq!(acme.contact, "mailto:ops@example.com");
+        assert!(!acme.production, "production defaults to false (staging)");
+    }
+
+    #[test]
+    fn rejects_acme_contact_without_mailto() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:4433"
+            [[clients]]
+            name = "a"
+            token = "0000000000000000000000000000000000000000000000000000000000000001"
+            [acme]
+            contact = "ops@example.com"
+            cache_dir = "/var/lib/tuyau/acme"
+        "#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        match cfg.validate() {
+            Err(ConfigError::AcmeContact(c)) => assert_eq!(c, "ops@example.com"),
+            other => panic!("expected AcmeContact, got {other:?}"),
         }
     }
 

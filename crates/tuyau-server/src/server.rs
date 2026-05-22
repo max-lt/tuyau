@@ -13,8 +13,11 @@ use tokio_util::sync::CancellationToken;
 
 use tuyau_protocol::{ALPN, FrameCodec, Hello, HelloResponse};
 
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+
 use crate::cert::{self, CertMaterial};
-use crate::config::{ClientEntry, ServerConfig, TlsMode};
+use crate::config::{AcmeSection, ClientEntry, ServerConfig, TlsMode};
 use crate::error::ServerError;
 use crate::public;
 use crate::routes::RoutingTable;
@@ -31,6 +34,7 @@ pub struct TunnelServer {
     cancel: CancellationToken,
     accept_handle: JoinHandle<()>,
     public_handle: Option<JoinHandle<()>>,
+    acme_handle: Option<JoinHandle<()>>,
 }
 
 impl TunnelServer {
@@ -58,10 +62,11 @@ impl TunnelServer {
         let cancel = CancellationToken::new();
         let routes = RoutingTable::new();
 
-        // Optional public listener — only spawned if configured. Generates a
-        // fresh multi-SAN self-signed cert per startup over the configured
-        // terminated hostnames. M5e will replace this with ACME-issued certs.
-        let (public_addr, public_handle) = match config.public_listen_addr {
+        // Optional public listener — only spawned if configured. The cert
+        // resolver is either a static self-signed multi-SAN cert (dev mode)
+        // or rustls-acme's resolver (ACME mode, real LE certs via
+        // TLS-ALPN-01).
+        let (public_addr, public_handle, acme_handle) = match config.public_listen_addr {
             Some(addr) => {
                 let terminated_hostnames: Vec<String> = config
                     .hostnames
@@ -69,21 +74,36 @@ impl TunnelServer {
                     .filter(|h| h.tls_mode == TlsMode::Terminated)
                     .map(|h| h.host.clone())
                     .collect();
-                let public_cert = cert::generate_public_cert(&terminated_hostnames, &cert_dir)?;
-                let handle = public::start(addr, public_cert, routes.clone(), cancel.clone())
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(error = %e, listen_addr = %addr, "public listener bind failed");
-                        e
-                    })?;
+
+                let (resolver, acme_handle) = build_cert_resolver(
+                    &config.acme,
+                    &terminated_hostnames,
+                    &cert_dir,
+                    cancel.clone(),
+                )?;
+                let acme_active = acme_handle.is_some();
+
+                let handle = public::start(
+                    addr,
+                    resolver,
+                    acme_active,
+                    routes.clone(),
+                    cancel.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, listen_addr = %addr, "public listener bind failed");
+                    e
+                })?;
                 tracing::info!(
                     listen_addr = %handle.local_addr,
-                    hostnames = terminated_hostnames.len(),
+                    terminated_hostnames = terminated_hostnames.len(),
+                    acme = acme_active,
                     "public TLS listener active"
                 );
-                (Some(handle.local_addr), Some(handle.join))
+                (Some(handle.local_addr), Some(handle.join), acme_handle)
             }
-            None => (None, None),
+            None => (None, None, None),
         };
 
         let config = Arc::new(config);
@@ -103,6 +123,7 @@ impl TunnelServer {
             cancel,
             accept_handle,
             public_handle,
+            acme_handle,
         })
     }
 
@@ -133,7 +154,96 @@ impl TunnelServer {
         if let Some(h) = self.public_handle {
             let _ = h.await;
         }
+        if let Some(h) = self.acme_handle {
+            let _ = h.await;
+        }
         self.endpoint.wait_idle().await;
+    }
+}
+
+/// Cert resolver plus the ACME renewal task handle when ACME is active.
+type ResolverBundle = (Arc<dyn ResolvesServerCert>, Option<JoinHandle<()>>);
+
+/// Build the cert resolver the public listener should use: rustls-acme's
+/// dynamic resolver if `[acme]` is configured (with a background renewal
+/// task), or a static resolver over a fresh self-signed multi-SAN cert
+/// otherwise.
+fn build_cert_resolver(
+    acme: &Option<AcmeSection>,
+    terminated_hostnames: &[String],
+    cert_dir: &std::path::Path,
+    cancel: CancellationToken,
+) -> Result<ResolverBundle, ServerError> {
+    if let Some(acme_cfg) = acme {
+        if terminated_hostnames.is_empty() {
+            tracing::warn!(
+                "[acme] configured but no terminated hostnames — falling back to a placeholder self-signed cert (passthrough-only deployment?)"
+            );
+        } else {
+            let (resolver, handle) = build_acme_resolver(acme_cfg, terminated_hostnames, cancel)?;
+            return Ok((resolver, Some(handle)));
+        }
+    }
+    let public_cert = cert::generate_public_cert(terminated_hostnames, cert_dir)?;
+    Ok((build_static_resolver(public_cert)?, None))
+}
+
+fn build_static_resolver(
+    material: CertMaterial,
+) -> Result<Arc<dyn ResolvesServerCert>, ServerError> {
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&material.key_der)
+        .map_err(ServerError::Tls)?;
+    let certified = CertifiedKey::new(vec![material.cert_der], signing_key);
+    Ok(Arc::new(StaticResolver(Arc::new(certified))))
+}
+
+fn build_acme_resolver(
+    cfg: &AcmeSection,
+    hostnames: &[String],
+    cancel: CancellationToken,
+) -> Result<(Arc<dyn ResolvesServerCert>, JoinHandle<()>), ServerError> {
+    use futures_util::StreamExt;
+    use rustls_acme::{AcmeConfig, caches::DirCache};
+
+    let mut state = AcmeConfig::new(hostnames.to_vec())
+        .contact_push(&cfg.contact)
+        .cache(DirCache::new(cfg.cache_dir.clone()))
+        .directory_lets_encrypt(cfg.production)
+        .state();
+    let resolver = state.resolver();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::debug!("acme renewal loop cancelled");
+                    break;
+                }
+                event = state.next() => {
+                    match event {
+                        Some(Ok(ok)) => tracing::info!("acme: {:?}", ok),
+                        Some(Err(err)) => tracing::warn!(error = ?err, "acme error"),
+                        None => {
+                            tracing::debug!("acme state stream ended");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok((resolver, handle))
+}
+
+/// Always returns the same `CertifiedKey` — used for the dev-mode multi-SAN
+/// self-signed cert. ACME mode uses rustls-acme's dynamic resolver instead.
+#[derive(Debug)]
+struct StaticResolver(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for StaticResolver {
+    fn resolve(&self, _ch: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
     }
 }
 

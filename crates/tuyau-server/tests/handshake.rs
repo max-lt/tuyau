@@ -23,6 +23,7 @@ async fn spin_up_server() -> (TunnelServer, TempDir) {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         public_listen_addr: None,
         tunnel_cert_dir: Some(dir.path().to_path_buf()),
+        acme: None,
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: VALID_TOKEN,
@@ -222,6 +223,7 @@ async fn fingerprint_stable_across_restarts() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         public_listen_addr: None,
         tunnel_cert_dir: Some(dir.path().to_path_buf()),
+        acme: None,
         clients: vec![ClientEntry {
             name: "a".into(),
             token: VALID_TOKEN,

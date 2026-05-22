@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use futures_util::SinkExt;
 use rustls::ServerConfig as RustlsServerConfig;
+use rustls::server::ResolvesServerCert;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -32,7 +33,6 @@ use tokio_util::sync::CancellationToken;
 
 use tuyau_protocol::{DataStreamHeader, FrameCodec, TlsMode};
 
-use crate::cert::CertMaterial;
 use crate::error::ServerError;
 use crate::routes::RoutingTable;
 use crate::sni::parse_sni;
@@ -48,14 +48,15 @@ pub(crate) struct PublicListenerHandle {
 
 pub(crate) async fn start(
     listen_addr: SocketAddr,
-    cert: CertMaterial,
+    cert_resolver: Arc<dyn ResolvesServerCert>,
+    acme_active: bool,
     routes: RoutingTable,
     cancel: CancellationToken,
 ) -> Result<PublicListenerHandle, ServerError> {
     let listener = TcpListener::bind(listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
-    let rustls_config = Arc::new(build_rustls_config(cert)?);
+    let rustls_config = Arc::new(build_rustls_config(cert_resolver, acme_active)?);
 
     let join = tokio::spawn(async move {
         accept_loop(listener, rustls_config, routes, cancel).await;
@@ -64,14 +65,24 @@ pub(crate) async fn start(
     Ok(PublicListenerHandle { local_addr, join })
 }
 
-fn build_rustls_config(cert: CertMaterial) -> Result<RustlsServerConfig, ServerError> {
-    let config = RustlsServerConfig::builder_with_provider(Arc::new(
+fn build_rustls_config(
+    cert_resolver: Arc<dyn ResolvesServerCert>,
+    acme_active: bool,
+) -> Result<RustlsServerConfig, ServerError> {
+    let mut config = RustlsServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(ServerError::Tls)?
     .with_no_client_auth()
-    .with_single_cert(vec![cert.cert_der], cert.key_der)?;
+    .with_cert_resolver(cert_resolver);
+    if acme_active {
+        // Advertise `acme-tls/1` so Let's Encrypt's validator picks it during
+        // TLS-ALPN-01 challenges and rustls-acme's resolver can answer.
+        config
+            .alpn_protocols
+            .push(rustls_acme::acme::ACME_TLS_ALPN_NAME.to_vec());
+    }
     Ok(config)
 }
 
@@ -150,28 +161,9 @@ async fn handle_public(
     //    on the first reads.
     let prefixed = PrefixedStream::new(client_hello, stream);
 
-    // 5. Open a QUIC bidi stream on the matching tunnel and send the header.
-    let (send, recv) = match route.conn.open_bi().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(peer = %peer, sni = %sni, error = %e, "open_bi on tunnel failed");
-            return Ok(());
-        }
-    };
-
-    let header = DataStreamHeader {
-        hostname: sni.clone(),
-        peer_addr: peer.to_string(),
-        mode: route.tls_mode,
-    };
-    let mut writer = FramedWrite::new(send, FrameCodec::<DataStreamHeader>::new());
-    if let Err(e) = writer.send(header).await {
-        tracing::warn!(peer = %peer, error = %e, "failed to send DataStreamHeader");
-        return Ok(());
-    }
-    let send = writer.into_inner();
-
-    // 6. Branch on TLS mode.
+    // 5. Branch on TLS mode. For terminated, do the TLS handshake BEFORE
+    //    opening the tunnel stream — if the handshake turns out to be an
+    //    ACME `acme-tls/1` challenge, no QUIC dispatch should happen.
     match route.tls_mode {
         TlsMode::Terminated => {
             let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), prefixed);
@@ -193,17 +185,64 @@ async fn handle_public(
                     return Ok(());
                 }
             };
+
+            // ACME TLS-ALPN-01 challenge: rustls-acme's resolver answered
+            // the handshake with a special cert, the validator closes.
+            // No tunnel dispatch needed — bail.
+            if tls_stream.get_ref().1.alpn_protocol() == Some(rustls_acme::acme::ACME_TLS_ALPN_NAME)
+            {
+                tracing::info!(peer = %peer, sni = %sni, "acme-tls/1 challenge served");
+                return Ok(());
+            }
+
+            // Real client request → dispatch over the tunnel now.
+            let (send, recv) = match open_tunnel_stream(&route, &sni, peer).await {
+                Some(p) => p,
+                None => return Ok(()),
+            };
             pipe_bytes(tls_stream, send, recv).await;
         }
         TlsMode::Passthrough => {
             // Forward raw TCP bytes (ClientHello included via PrefixedStream)
             // straight to the tunnel — no termination, no plaintext on this
             // box. This is the structural privacy guarantee.
+            let (send, recv) = match open_tunnel_stream(&route, &sni, peer).await {
+                Some(p) => p,
+                None => return Ok(()),
+            };
             pipe_bytes(prefixed, send, recv).await;
         }
     }
 
     Ok(())
+}
+
+/// Open a bidi QUIC stream on the matched tunnel and send the
+/// `DataStreamHeader` as the first frame. Returns `None` on any failure
+/// (logged); caller drops the connection.
+async fn open_tunnel_stream(
+    route: &crate::routes::RouteEntry,
+    sni: &str,
+    peer: SocketAddr,
+) -> Option<(quinn::SendStream, quinn::RecvStream)> {
+    let (send, recv) = match route.conn.open_bi().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(peer = %peer, sni = %sni, error = %e, "open_bi on tunnel failed");
+            return None;
+        }
+    };
+    let header = DataStreamHeader {
+        hostname: sni.to_string(),
+        peer_addr: peer.to_string(),
+        mode: route.tls_mode,
+    };
+    let mut writer = FramedWrite::new(send, FrameCodec::<DataStreamHeader>::new());
+    if let Err(e) = writer.send(header).await {
+        tracing::warn!(peer = %peer, error = %e, "failed to send DataStreamHeader");
+        return None;
+    }
+    Some((writer.into_inner(), recv))
 }
 
 /// Read exactly one TLS record from `stream` into a Vec (header + body).

@@ -39,8 +39,11 @@ a local service.
   token via `--token-file` / `TUYAU_TOKEN_FILE` (Docker secrets), no bare
   hex on the command line. TOML config is opt-in via `--config`.
 - **Pinned tunnel cert**: the client pins the server's tunnel cert by SHA-256
-  fingerprint — no PKI, no LE for the tunnel itself. Public cert is separate
-  (ACME planned).
+  fingerprint — no PKI, no LE for the tunnel itself.
+- **ACME / Let's Encrypt for public certs**: enable an optional `[acme]`
+  block in `server.toml` to fetch real browser-trusted certs via
+  TLS-ALPN-01. Without it, the public listener serves a dev self-signed
+  multi-SAN cert (`curl -k` works; browsers complain).
 
 ## Quick start
 

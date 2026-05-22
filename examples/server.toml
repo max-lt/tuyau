@@ -36,3 +36,15 @@ client = "service-a"
 host = "beta.example.com"
 client = "service-a"
 tls_mode = "passthrough"
+
+# Optional ACME / Let's Encrypt block. When uncommented, the public listener
+# fetches real browser-trusted certs via TLS-ALPN-01 instead of using a dev
+# self-signed cert. Applies to `terminated` hostnames only — passthrough
+# never needs a cert. Leave commented for local development.
+#
+# [acme]
+# contact = "mailto:ops@example.com"
+# cache_dir = "/var/lib/tuyau/acme"
+# production = false   # false = LE staging (untrusted certs, generous rate
+#                      # limits — recommended for first deploy)
+#                      # true  = LE production

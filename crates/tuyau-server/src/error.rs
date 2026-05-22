@@ -37,6 +37,9 @@ pub enum ConfigError {
 
     #[error("hostname '{host}' references unknown client '{client}'")]
     UnknownClient { host: String, client: String },
+
+    #[error("acme.contact must be a mailto: URL, got '{0}'")]
+    AcmeContact(String),
 }
 
 #[derive(Debug, Error)]
