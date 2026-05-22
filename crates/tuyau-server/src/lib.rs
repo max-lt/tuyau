@@ -6,6 +6,7 @@ mod error;
 mod public;
 mod routes;
 mod server;
+mod sni;
 
 pub use config::{ClientEntry, HostnameEntry, ServerConfig, TlsMode};
 pub use error::{CertError, ConfigError, ServerError};

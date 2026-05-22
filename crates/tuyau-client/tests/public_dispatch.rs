@@ -199,10 +199,86 @@ async fn public_tls_with_unknown_sni_is_dropped() {
     server.shutdown().await;
 }
 
+/// Spawn a TLS-terminating HTTP/1.1 server on loopback with a fresh
+/// self-signed cert for the given hostname. tuyau-server NEVER has this cert
+/// — that's the whole point of the passthrough test below.
+async fn spawn_local_tls_http(hostname: String, body: Arc<Vec<u8>>) -> SocketAddr {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rustls::ServerConfig as RustlsServerConfig;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec![hostname.clone()]).unwrap();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, hostname.as_str());
+    params.distinguished_name = dn;
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().clone();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+
+    let tls_config = RustlsServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key_der)
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let body = body.clone();
+            let acc = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acc.accept(tcp).await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match tls.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&tmp[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len(),
+                );
+                let _ = tls.write_all(header.as_bytes()).await;
+                let _ = tls.write_all(&body).await;
+                let _ = tls.flush().await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
 #[tokio::test]
-async fn public_tls_to_passthrough_is_dropped_in_m5b() {
-    // Passthrough wiring is M5f; for now the server logs and drops the
-    // connection without completing the TLS handshake.
+async fn public_tls_passthrough_forwards_raw_tls() {
+    // The tuyau-server runs a passthrough route for "secure.example.com" and
+    // has NO cert covering that hostname. A local rustls server holds the
+    // matching cert privately. If tuyau-server were terminating, the TLS
+    // handshake to the public client would fail (no SAN match). The fact
+    // that the public client receives a response signed by the LOCAL server's
+    // cert proves the bytes flowed through opaquely.
+    let body = Arc::new(b"from-passthrough".to_vec());
+    let local_addr =
+        spawn_local_tls_http("secure.example.com".to_string(), Arc::clone(&body)).await;
+
     let (server, _dir) = spin_up_with_public(vec![HostnameEntry {
         host: "secure.example.com".into(),
         client: "service-a".into(),
@@ -210,22 +286,34 @@ async fn public_tls_to_passthrough_is_dropped_in_m5b() {
     }])
     .await;
 
-    let tunnel_client = connect_tunnel(&server).await;
+    let tunnel = connect_tunnel_with(
+        &server,
+        vec![tuyau_client::IngressRule {
+            host: "secure.example.com".into(),
+            local_addr: local_addr.to_string(),
+        }],
+    )
+    .await;
+    let tunnel = Arc::new(tunnel);
+    let serve_client = Arc::clone(&tunnel);
+    let serve_handle = tokio::spawn(async move { serve_client.serve().await });
 
     let public_addr = server.public_local_addr().unwrap();
-    let result = public_tls(public_addr, "secure.example.com").await;
-    assert!(
-        result.is_err(),
-        "passthrough hostnames must not complete TLS handshake in M5b"
-    );
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        http_get(public_addr, "secure.example.com"),
+    )
+    .await
+    .expect("passthrough response within 5s");
 
-    let accept = tokio::time::timeout(Duration::from_millis(500), tunnel_client.accept_bi()).await;
     assert!(
-        accept.is_err(),
-        "passthrough drop must not dispatch on the tunnel"
+        resp.starts_with(b"HTTP/1.1 200 OK"),
+        "non-200 on passthrough: {:?}",
+        String::from_utf8_lossy(&resp)
     );
+    assert_eq!(http_body(&resp), body.as_slice());
 
-    tunnel_client.shutdown().await;
+    serve_handle.abort();
     server.shutdown().await;
 }
 

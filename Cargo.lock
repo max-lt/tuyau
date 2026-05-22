@@ -1533,6 +1533,7 @@ dependencies = [
  "hostname",
  "pin-project-lite",
  "quinn",
+ "rcgen",
  "rustls",
  "serde",
  "sha2",

@@ -11,3 +11,6 @@ Cargo.lock.bak
 # Cert/key material — never commit
 *.pem
 *.key
+
+# Runtime artefacts (Claude Code scheduler etc.)
+.claude/scheduled_tasks.lock

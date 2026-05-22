@@ -39,3 +39,4 @@ axum = { workspace = true }
 anyhow = { workspace = true }
 hostname = { workspace = true }
 tracing-subscriber = { workspace = true }
+rcgen = { workspace = true }
