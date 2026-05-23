@@ -45,6 +45,26 @@ a local service.
   TLS-ALPN-01. Without it, the public listener serves a dev self-signed
   multi-SAN cert (`curl -k` works; browsers complain).
 
+## Build
+
+Requires Rust 1.85+ (edition 2024). Both `server` and `client` ship as
+subcommands of the same `tuyau` binary.
+
+```bash
+cargo build --release                     # binary at target/release/tuyau
+cargo install --path crates/tuyau-cli     # or put `tuyau` on PATH
+```
+
+Container image (server + client in one):
+
+```bash
+docker build -t tuyau .
+```
+
+Embedding the client as a library: add `tuyau-client` as a dependency and
+enable the `axum` feature for the [`axum::serve`](#3-or-embed-it-in-your-axum-app)
+adapter.
+
 ## Quick start
 
 ### 1. Run the server

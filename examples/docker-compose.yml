@@ -13,7 +13,7 @@
 
 services:
   tuyau-client:
-    image: tuyau:latest # build locally for now: `docker build -t tuyau .`
+    image: tuyau:latest # built from the repo Dockerfile: `docker build -t tuyau .`
     # --ingress maps each public hostname to a local service. Repeatable.
     # Here "app" is another service on the compose network.
     command: ["client", "--ingress", "alpha.example.com=app:8080"]
