@@ -48,3 +48,12 @@ tls_mode = "passthrough"
 # production = false   # false = LE staging (untrusted certs, generous rate
 #                      # limits — recommended for first deploy)
 #                      # true  = LE production
+
+# Alternatively, serve a certificate obtained out-of-band — useful when inbound
+# TLS-ALPN-01 can't run (public 443 is held by another service, or inbound IPv6
+# is unreliable for the CA's validation). Get the cert however you like, e.g.
+# Let's Encrypt via DNS-01, and point tuyau at the PEM chain + key. Mutually
+# exclusive with [acme]; applies to `terminated` hostnames.
+#
+# tls_cert_file = "/etc/letsencrypt/live/alpha.example.com/fullchain.pem"
+# tls_key_file  = "/etc/letsencrypt/live/alpha.example.com/privkey.pem"

@@ -44,6 +44,10 @@ a local service.
   block in `server.toml` to fetch real browser-trusted certs via
   TLS-ALPN-01. Without it, the public listener serves a dev self-signed
   multi-SAN cert (`curl -k` works; browsers complain).
+- **Bring your own cert**: when inbound TLS-ALPN-01 can't run (public 443 is
+  held by another service, or inbound IPv6 is unreliable for the CA's
+  validation), set `tls_cert_file` / `tls_key_file` to serve a cert obtained
+  out-of-band — e.g. Let's Encrypt via DNS-01. No inbound validation needed.
 
 ## Build
 
