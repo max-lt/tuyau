@@ -62,3 +62,9 @@ tuyau-protocol = { path = "crates/tuyau-protocol" }
 tuyau-server = { path = "crates/tuyau-server" }
 tuyau-client = { path = "crates/tuyau-client" }
 tuyau-cli = { path = "crates/tuyau-cli" }
+
+# Local patch of rustls-acme 0.13.0: adds a catch-all `Unknown` variant to
+# ChallengeType so Let's Encrypt's newer challenge types (e.g. dns-persist-01)
+# don't break deserialization of the challenges array. See vendor/rustls-acme.
+[patch.crates-io]
+rustls-acme = { path = "vendor/rustls-acme" }
