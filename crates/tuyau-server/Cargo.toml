@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Expose the dynamic routing seam (RoutingBackend + TunnelServer::start_with)
+# for embedders such as a managed control plane. Off by default: the self-host
+# binary stays static/config-file only.
+dynamic = []
+
 [dependencies]
 tuyau-protocol = { workspace = true }
 quinn = { workspace = true }

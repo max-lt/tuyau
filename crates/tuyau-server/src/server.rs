@@ -40,7 +40,27 @@ pub struct TunnelServer {
 impl TunnelServer {
     pub async fn start(config: ServerConfig) -> Result<Self, ServerError> {
         config.validate()?;
+        let backend: Arc<dyn RoutingBackend> = Arc::new(StaticBackend::new(&config));
+        Self::start_inner(backend, config).await
+    }
 
+    /// Start with a caller-provided [`RoutingBackend`] instead of the static
+    /// config-file one. Available with the `dynamic` feature. The backend owns
+    /// identity + routing decisions, so `config.clients` and `config.hostnames`
+    /// are ignored — everything else (listen addrs, certs, ACME) still applies.
+    #[cfg(feature = "dynamic")]
+    pub async fn start_with(
+        backend: Arc<dyn RoutingBackend>,
+        config: ServerConfig,
+    ) -> Result<Self, ServerError> {
+        config.validate_dynamic()?;
+        Self::start_inner(backend, config).await
+    }
+
+    async fn start_inner(
+        backend: Arc<dyn RoutingBackend>,
+        config: ServerConfig,
+    ) -> Result<Self, ServerError> {
         let cert_dir = resolve_cert_dir(&config.tunnel_cert_dir);
         let material = cert::load_or_generate(&cert_dir)?;
 
@@ -108,10 +128,6 @@ impl TunnelServer {
             None => (None, None, None),
         };
 
-        // Self-host / static mode: routing decisions come from the config file.
-        // The `dynamic` feature will let an embedder inject its own backend
-        // instead, without the core knowing anything about it.
-        let backend: Arc<dyn RoutingBackend> = Arc::new(StaticBackend::new(&config));
         let endpoint_clone = endpoint.clone();
         let routes_clone = routes.clone();
         let cancel_clone = cancel.clone();

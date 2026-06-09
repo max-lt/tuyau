@@ -20,11 +20,14 @@ jobs:
         features:
           - default
           - axum
+          - dynamic
         include:
           - features: default
             feature_flag: ""
           - features: axum
             feature_flag: "--features tuyau-client/axum"
+          - features: dynamic
+            feature_flag: "--features tuyau-server/dynamic"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,11 +63,14 @@ jobs:
         features:
           - default
           - axum
+          - dynamic
         include:
           - features: default
             feature_flag: ""
           - features: axum
             feature_flag: "--features tuyau-client/axum"
+          - features: dynamic
+            feature_flag: "--features tuyau-server/dynamic"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -113,12 +113,23 @@ impl ServerConfig {
             }
         }
 
+        self.validate_acme()
+    }
+
+    /// Validation for dynamic mode (`dynamic` feature): the routing backend
+    /// owns clients + hostnames, so only the non-routing config (ACME contact)
+    /// is checked. In particular, an empty `clients` list is allowed.
+    #[cfg(feature = "dynamic")]
+    pub fn validate_dynamic(&self) -> Result<(), ConfigError> {
+        self.validate_acme()
+    }
+
+    fn validate_acme(&self) -> Result<(), ConfigError> {
         if let Some(acme) = &self.acme
             && !acme.contact.starts_with("mailto:")
         {
             return Err(ConfigError::AcmeContact(acme.contact.clone()));
         }
-
         Ok(())
     }
 }
@@ -311,5 +322,23 @@ mod tests {
         "#;
         let cfg = ServerConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.hostnames[0].tls_mode, TlsMode::Terminated);
+    }
+
+    #[cfg(feature = "dynamic")]
+    #[test]
+    fn validate_dynamic_relaxes_clients_but_keeps_acme() {
+        // Empty clients: static rejects, dynamic allows (backend owns identity).
+        let empty =
+            ServerConfig::from_toml_str("listen_addr = \"127.0.0.1:4433\"\nclients = []").unwrap();
+        assert!(empty.validate().is_err());
+        assert!(empty.validate_dynamic().is_ok());
+
+        // ACME contact is still validated in dynamic mode.
+        let bad_acme = ServerConfig::from_toml_str(
+            "listen_addr = \"127.0.0.1:4433\"\nclients = []\n\
+             [acme]\ncontact = \"ops@example.com\"\ncache_dir = \"/tmp/a\"",
+        )
+        .unwrap();
+        assert!(bad_acme.validate_dynamic().is_err());
     }
 }
