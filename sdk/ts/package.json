@@ -1,0 +1,33 @@
+{
+  "name": "@tuyau/client",
+  "version": "0.1.0",
+  "description": "Native TypeScript client for the tuyau QUIC reverse tunnel (quiche under the hood, tuyau wire protocol in TS).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@matrixai/quic": "^2.0.9",
+    "cbor-x": "^1.5.9"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.2",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
