@@ -2046,6 +2046,7 @@ dependencies = [
 name = "tuyau-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures-util",
  "hex",
  "quinn",

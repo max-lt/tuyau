@@ -1,5 +1,6 @@
 //! Tuyau server: QUIC listener, cert handling, token validation.
 
+mod backend;
 mod cert;
 mod config;
 mod error;

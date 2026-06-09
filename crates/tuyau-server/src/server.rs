@@ -6,7 +6,6 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig, crypto::rustls::QuicServerConfig};
 use rustls::ServerConfig as RustlsServerConfig;
-use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
@@ -16,8 +15,9 @@ use tuyau_protocol::{ALPN, FrameCodec, Hello, HelloResponse};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
+use crate::backend::{RoutingBackend, StaticBackend};
 use crate::cert::{self, CertMaterial};
-use crate::config::{AcmeSection, ClientEntry, ServerConfig, TlsMode};
+use crate::config::{AcmeSection, ServerConfig, TlsMode};
 use crate::error::ServerError;
 use crate::public;
 use crate::routes::RoutingTable;
@@ -108,13 +108,16 @@ impl TunnelServer {
             None => (None, None, None),
         };
 
-        let config = Arc::new(config);
+        // Self-host / static mode: routing decisions come from the config file.
+        // The `dynamic` feature will let an embedder inject its own backend
+        // instead, without the core knowing anything about it.
+        let backend: Arc<dyn RoutingBackend> = Arc::new(StaticBackend::new(&config));
         let endpoint_clone = endpoint.clone();
         let routes_clone = routes.clone();
         let cancel_clone = cancel.clone();
 
         let accept_handle = tokio::spawn(async move {
-            accept_loop(endpoint_clone, config, routes_clone, cancel_clone).await;
+            accept_loop(endpoint_clone, backend, routes_clone, cancel_clone).await;
         });
 
         Ok(Self {
@@ -308,7 +311,7 @@ fn build_quinn_config(rustls_config: RustlsServerConfig) -> Result<QuinnServerCo
 
 async fn accept_loop(
     endpoint: Endpoint,
-    config: Arc<ServerConfig>,
+    backend: Arc<dyn RoutingBackend>,
     routes: RoutingTable,
     cancel: CancellationToken,
 ) {
@@ -323,11 +326,11 @@ async fn accept_loop(
                     tracing::debug!("endpoint closed");
                     break;
                 };
-                let config = Arc::clone(&config);
+                let backend = Arc::clone(&backend);
                 let routes = routes.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_incoming(incoming, config, routes, cancel).await {
+                    if let Err(e) = handle_incoming(incoming, backend, routes, cancel).await {
                         tracing::warn!(error = %e, "connection handler error");
                     }
                 });
@@ -346,7 +349,7 @@ enum Outcome {
 
 async fn handle_incoming(
     incoming: quinn::Incoming,
-    config: Arc<ServerConfig>,
+    backend: Arc<dyn RoutingBackend>,
     routes: RoutingTable,
     cancel: CancellationToken,
 ) -> Result<(), ServerError> {
@@ -375,26 +378,19 @@ async fn handle_incoming(
     let hello_result = tokio::time::timeout(HELLO_TIMEOUT, reader.next()).await;
 
     let outcome = match hello_result {
-        Ok(Some(Ok(hello))) => match match_token(&hello.token, &config.clients) {
-            Some(matched_name) => {
-                let assigned: Vec<(String, TlsMode)> = config
-                    .hostnames
-                    .iter()
-                    .filter(|h| h.client == matched_name)
-                    .map(|h| (h.host.clone(), h.tls_mode))
-                    .collect();
+        Ok(Some(Ok(hello))) => match backend.admit(&hello.token).await {
+            Some(grant) => {
+                let host_list: Vec<&str> =
+                    grant.hostnames.iter().map(|(h, _)| h.as_str()).collect();
 
-                let host_list: Vec<&str> = assigned.iter().map(|(h, _)| h.as_str()).collect();
-
-                let balance = config
-                    .clients
-                    .iter()
-                    .find(|c| c.name == matched_name)
-                    .map(|c| c.balance)
-                    .unwrap_or_default();
-                for prev in routes.install(assigned.clone(), &matched_name, balance, &connection) {
+                for prev in routes.install(
+                    grant.hostnames.clone(),
+                    &grant.client_name,
+                    grant.balance,
+                    &connection,
+                ) {
                     tracing::info!(
-                        name = %matched_name,
+                        name = %grant.client_name,
                         "kicking previous connection (last-write-wins)"
                     );
                     prev.close(0u32.into(), b"replaced by new connection");
@@ -402,7 +398,7 @@ async fn handle_incoming(
 
                 tracing::info!(
                     peer = %peer,
-                    name = %matched_name,
+                    name = %grant.client_name,
                     client_name = %hello.client_name,
                     hosts = ?host_list,
                     "client connected"
@@ -480,14 +476,4 @@ async fn handle_incoming(
     }
 
     Ok(())
-}
-
-fn match_token(token: &[u8; 32], clients: &[ClientEntry]) -> Option<String> {
-    let mut matched: Option<&str> = None;
-    for c in clients {
-        if token.ct_eq(&c.token).into() {
-            matched = Some(&c.name);
-        }
-    }
-    matched.map(str::to_owned)
 }

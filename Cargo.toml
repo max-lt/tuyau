@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 pin-project-lite = "0.2"
+async-trait = "0.1"
 
 # Optional axum integration (behind tuyau-client's `axum` feature).
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
