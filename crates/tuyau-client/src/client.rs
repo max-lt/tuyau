@@ -144,6 +144,14 @@ impl TunnelClient {
         crate::TunnelListener::new(self.connection.clone())
     }
 
+    /// Listener that terminates TLS over the tunnel with the app's own cert —
+    /// the passthrough-mode counterpart to [`listener`](Self::listener). The
+    /// server forwards raw TLS bytes; this app is the TLS endpoint.
+    #[cfg(feature = "tls")]
+    pub fn tls_listener(&self, acceptor: tokio_rustls::TlsAcceptor) -> crate::TlsTunnelListener {
+        crate::TlsTunnelListener::new(self.listener(), acceptor)
+    }
+
     /// Wait for the next server-initiated bidi stream and read its
     /// `DataStreamHeader` (first frame). Returns the header plus the raw
     /// stream halves for byte-level forwarding.

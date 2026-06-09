@@ -4,9 +4,13 @@ mod client;
 mod config;
 mod error;
 mod listener;
+#[cfg(feature = "tls")]
+mod tls;
 mod verifier;
 
 pub use client::{TunnelClient, TunnelStream};
 pub use config::{ClientConfig, IngressRule};
 pub use error::{ClientError, ConfigError};
 pub use listener::{TunnelConnection, TunnelListener};
+#[cfg(feature = "tls")]
+pub use tls::TlsTunnelListener;
