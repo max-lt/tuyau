@@ -77,8 +77,16 @@ fn build_rustls_config(
     .with_no_client_auth()
     .with_cert_resolver(cert_resolver);
     if acme_active {
-        // Advertise `acme-tls/1` so Let's Encrypt's validator picks it during
-        // TLS-ALPN-01 challenges and rustls-acme's resolver can answer.
+        // Advertise `http/1.1` first so ordinary clients (browsers always send
+        // an ALPN list of h2/http/1.1) find a common protocol — once
+        // alpn_protocols is non-empty, rustls rejects any client with no
+        // overlap via a fatal NoApplicationProtocol alert. We only offer
+        // http/1.1 (not h2): terminated mode is a transparent byte-pipe to an
+        // arbitrary backend, and http/1.1 is universally understood.
+        config.alpn_protocols.push(b"http/1.1".to_vec());
+        // Then `acme-tls/1` so Let's Encrypt's validator picks it during
+        // TLS-ALPN-01 challenges and rustls-acme's resolver can answer. ACME
+        // validators offer only this, so ordering never collides with browsers.
         config
             .alpn_protocols
             .push(rustls_acme::acme::ACME_TLS_ALPN_NAME.to_vec());
