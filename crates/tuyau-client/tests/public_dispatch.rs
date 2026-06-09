@@ -32,6 +32,8 @@ async fn spin_up_with_public(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
         tunnel_cert_dir: Some(dir.path().to_path_buf()),
         acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: TOKEN,
@@ -646,6 +648,8 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
         public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
         tunnel_cert_dir: Some(dir.path().to_path_buf()),
         acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
         clients: vec![
             ClientEntry {
                 name: "alpha-srv".into(),

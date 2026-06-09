@@ -19,6 +19,8 @@ async fn spin_up_server_with(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         public_listen_addr: None,
         tunnel_cert_dir: Some(dir.path().to_path_buf()),
         acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: VALID_TOKEN,
