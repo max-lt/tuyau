@@ -29,6 +29,7 @@ async fn spin_up_server() -> (TunnelServer, TempDir) {
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: VALID_TOKEN,
+            balance: Default::default(),
         }],
         hostnames: vec![],
     };
@@ -231,6 +232,7 @@ async fn fingerprint_stable_across_restarts() {
         clients: vec![ClientEntry {
             name: "a".into(),
             token: VALID_TOKEN,
+            balance: Default::default(),
         }],
         hostnames: vec![],
     };

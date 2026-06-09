@@ -24,6 +24,7 @@ async fn spin_up_server_with(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: VALID_TOKEN,
+            balance: Default::default(),
         }],
         hostnames,
     };

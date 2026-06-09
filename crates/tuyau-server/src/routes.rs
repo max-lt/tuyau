@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::config::TlsMode;
+use crate::config::{Balance, TlsMode};
 
+/// A single resolved route: the tunnel connection chosen to serve one public
+/// connection, plus the metadata the public listener needs.
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
     pub client_name: String,
@@ -10,9 +13,21 @@ pub struct RouteEntry {
     pub conn: quinn::Connection,
 }
 
+/// All tunnels currently serving one hostname. With `last-write-wins` there is
+/// ever only one; with `round-robin` there may be several (active-active), and
+/// `cursor` spreads public connections across them.
+#[derive(Debug)]
+struct HostRoutes {
+    client_name: String,
+    tls_mode: TlsMode,
+    balance: Balance,
+    conns: Vec<quinn::Connection>,
+    cursor: AtomicUsize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RoutingTable {
-    inner: Arc<RwLock<HashMap<String, RouteEntry>>>,
+    inner: Arc<RwLock<HashMap<String, HostRoutes>>>,
 }
 
 impl RoutingTable {
@@ -20,55 +35,77 @@ impl RoutingTable {
         Self::default()
     }
 
-    /// Install routes for a freshly authenticated connection. If any of the
-    /// requested hosts is currently held by a different `quinn::Connection`
-    /// (necessarily owned by a previous session of the same matched client,
-    /// since `host` is unique by config validation), that connection is
-    /// returned so the caller can close it — last-write-wins on reconnect.
+    /// Install routes for a freshly authenticated connection, applying the
+    /// client's `balance` policy:
+    ///
+    /// - `LastWriteWins`: the new connection replaces any previous ones for
+    ///   each host; the displaced connections are returned so the caller can
+    ///   close them.
+    /// - `RoundRobin`: the new connection is *added* to each host's set and
+    ///   coexists with the others; nothing is displaced.
+    ///
+    /// Returns the connections that were displaced (empty under `RoundRobin`,
+    /// or when nothing was holding the hosts yet).
     pub fn install(
         &self,
         hosts: Vec<(String, TlsMode)>,
         client_name: &str,
+        balance: Balance,
         conn: &quinn::Connection,
-    ) -> Option<quinn::Connection> {
+    ) -> Vec<quinn::Connection> {
         if hosts.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         let mut guard = self.inner.write().expect("routes lock poisoned");
         let new_id = conn.stable_id();
-        let mut kicked: Option<quinn::Connection> = None;
+        let mut displaced: Vec<quinn::Connection> = Vec::new();
 
-        for (host, _) in &hosts {
-            if let Some(existing) = guard.get(host)
-                && existing.conn.stable_id() != new_id
-            {
-                kicked = Some(existing.conn.clone());
+        for (host, tls_mode) in hosts {
+            let entry = guard.entry(host).or_insert_with(|| HostRoutes {
+                client_name: client_name.to_string(),
+                tls_mode,
+                balance,
+                conns: Vec::new(),
+                cursor: AtomicUsize::new(0),
+            });
+            // Refresh metadata to the latest config view for this client.
+            entry.client_name = client_name.to_string();
+            entry.tls_mode = tls_mode;
+            entry.balance = balance;
+
+            match balance {
+                Balance::LastWriteWins => {
+                    for c in entry.conns.drain(..) {
+                        if c.stable_id() != new_id {
+                            displaced.push(c);
+                        }
+                    }
+                    entry.conns.push(conn.clone());
+                }
+                Balance::RoundRobin => {
+                    if !entry.conns.iter().any(|c| c.stable_id() == new_id) {
+                        entry.conns.push(conn.clone());
+                    }
+                }
             }
         }
 
-        for (host, tls_mode) in hosts {
-            guard.insert(
-                host,
-                RouteEntry {
-                    client_name: client_name.to_string(),
-                    tls_mode,
-                    conn: conn.clone(),
-                },
-            );
-        }
-
-        kicked
+        displaced
     }
 
-    /// Remove every entry whose connection matches `stable_id`. Called when
-    /// the owning connection closes (peer-initiated, timeout, or shutdown).
+    /// Remove every connection matching `stable_id` from all hosts, dropping
+    /// any host left with no connections. Called when a tunnel closes
+    /// (peer-initiated, timeout, or shutdown).
     pub fn remove_conn(&self, stable_id: usize) {
         let mut guard = self.inner.write().expect("routes lock poisoned");
-        guard.retain(|_, entry| entry.conn.stable_id() != stable_id);
+        guard.retain(|_, entry| {
+            entry.conns.retain(|c| c.stable_id() != stable_id);
+            !entry.conns.is_empty()
+        });
     }
 
-    /// Sorted snapshot of currently active hostnames.
+    /// Sorted snapshot of currently active hostnames (those with ≥1 tunnel).
     pub fn active_hostnames(&self) -> Vec<String> {
         let guard = self.inner.read().expect("routes lock poisoned");
         let mut hosts: Vec<String> = guard.keys().cloned().collect();
@@ -76,11 +113,21 @@ impl RoutingTable {
         hosts
     }
 
-    /// Clone of the route entry for `host`, if any. Used by the public listener
-    /// to find the tunnel connection responsible for an incoming public TLS
-    /// connection.
+    /// Resolve `host` to one tunnel connection. With multiple connections
+    /// (round-robin) successive lookups cycle through them; with one it always
+    /// returns that one. Used by the public listener per incoming connection.
     pub fn lookup(&self, host: &str) -> Option<RouteEntry> {
         let guard = self.inner.read().expect("routes lock poisoned");
-        guard.get(host).cloned()
+        let entry = guard.get(host)?;
+        let n = entry.conns.len();
+        if n == 0 {
+            return None;
+        }
+        let idx = entry.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        Some(RouteEntry {
+            client_name: entry.client_name.clone(),
+            tls_mode: entry.tls_mode,
+            conn: entry.conns[idx].clone(),
+        })
     }
 }

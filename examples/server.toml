@@ -23,6 +23,13 @@ name = "service-a"
 # 32-byte token, 64 lowercase hex chars. Generate with:
 #   openssl rand -hex 32
 token = "0000000000000000000000000000000000000000000000000000000000000001"
+# How to treat several tunnels sharing this token:
+#   "last-write-wins" (default) — newest tunnel replaces the previous one
+#                                 (clean reconnects).
+#   "round-robin"               — all concurrent tunnels stay registered and
+#                                 public connections are spread across them
+#                                 (active-active fan-out / HA).
+# balance = "last-write-wins"
 
 # Hostname-to-client bindings. The server is the source of truth for which
 # client serves which hostname; the client never claims hostnames on the wire.

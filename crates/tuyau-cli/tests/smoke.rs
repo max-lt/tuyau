@@ -24,6 +24,7 @@ async fn end_to_end_handshake() {
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: TOKEN,
+            balance: Default::default(),
         }],
         hostnames: vec![HostnameEntry {
             host: "alpha.example.com".into(),

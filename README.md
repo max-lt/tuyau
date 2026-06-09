@@ -28,6 +28,10 @@ a local service.
 - **Hostname routing**: one server fronts many services on shared 443, routed
   by SNI / Host header. Server config is the single source of truth for the
   hostname → client binding.
+- **Per-client balancing**: when several tunnels share one client token, the
+  server either hands over to the newest (`last-write-wins`, default — clean
+  reconnects) or spreads public connections across them (`round-robin` —
+  active-active fan-out / HA), set per `[[clients]]` entry.
 - **Two TLS modes per hostname**: `terminated` (server decrypts, plaintext
   flows over the tunnel) or `passthrough` (server only peeks the SNI, raw
   TLS bytes flow over the tunnel — the server never sees plaintext).

@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use tuyau_client::{ClientConfig, TunnelClient};
-use tuyau_server::{ClientEntry, HostnameEntry, ServerConfig, TlsMode, TunnelServer};
+use tuyau_server::{Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, TunnelServer};
 
 const TOKEN: [u8; 32] = [0x42; 32];
 
@@ -37,6 +37,7 @@ async fn spin_up_with_public(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: TOKEN,
+            balance: Default::default(),
         }],
         hostnames,
     };
@@ -654,10 +655,12 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
             ClientEntry {
                 name: "alpha-srv".into(),
                 token: TOKEN_A,
+                balance: Default::default(),
             },
             ClientEntry {
                 name: "beta-srv".into(),
                 token: TOKEN_B,
+                balance: Default::default(),
             },
         ],
         hostnames: vec![
@@ -725,6 +728,63 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
 
     h_a.abort();
     h_b.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn round_robin_spreads_public_connections_across_tunnels() {
+    // One client identity in round-robin mode, two concurrent tunnels sharing
+    // the same token. Two public connections to the same hostname must be
+    // split one-per-tunnel — under last-write-wins the first tunnel would
+    // instead be kicked and its accept_bi would error rather than yield.
+    let dir = TempDir::new().unwrap();
+    let server_cfg = ServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+        tunnel_cert_dir: Some(dir.path().to_path_buf()),
+        acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
+        clients: vec![ClientEntry {
+            name: "service-a".into(),
+            token: TOKEN,
+            balance: Balance::RoundRobin,
+        }],
+        hostnames: vec![HostnameEntry {
+            host: "alpha.example.com".into(),
+            client: "service-a".into(),
+            tls_mode: TlsMode::Terminated,
+        }],
+    };
+    let server = TunnelServer::start(server_cfg).await.unwrap();
+
+    // Both tunnels authenticate as the same client → both stay registered.
+    let tunnel_1 = connect_tunnel(&server).await;
+    let tunnel_2 = connect_tunnel(&server).await;
+
+    let public_addr = server.public_local_addr().expect("public listener bound");
+
+    // Two public connections to the same hostname (kept alive until dispatched).
+    let _p0 = public_tls(public_addr, "alpha.example.com")
+        .await
+        .expect("public TLS handshake 0");
+    let _p1 = public_tls(public_addr, "alpha.example.com")
+        .await
+        .expect("public TLS handshake 1");
+
+    // Each tunnel must receive exactly one dispatched stream.
+    let s1 = tokio::time::timeout(Duration::from_secs(5), tunnel_1.accept_bi())
+        .await
+        .expect("tunnel_1 accept_bi within 5s")
+        .expect("tunnel_1 must receive a dispatched stream (not be kicked)");
+    let s2 = tokio::time::timeout(Duration::from_secs(5), tunnel_2.accept_bi())
+        .await
+        .expect("tunnel_2 accept_bi within 5s")
+        .expect("tunnel_2 must receive a dispatched stream");
+
+    assert_eq!(s1.header.hostname, "alpha.example.com");
+    assert_eq!(s2.header.hostname, "alpha.example.com");
+
     server.shutdown().await;
 }
 

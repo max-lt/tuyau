@@ -386,7 +386,13 @@ async fn handle_incoming(
 
                 let host_list: Vec<&str> = assigned.iter().map(|(h, _)| h.as_str()).collect();
 
-                if let Some(prev) = routes.install(assigned.clone(), &matched_name, &connection) {
+                let balance = config
+                    .clients
+                    .iter()
+                    .find(|c| c.name == matched_name)
+                    .map(|c| c.balance)
+                    .unwrap_or_default();
+                for prev in routes.install(assigned.clone(), &matched_name, balance, &connection) {
                     tracing::info!(
                         name = %matched_name,
                         "kicking previous connection (last-write-wins)"

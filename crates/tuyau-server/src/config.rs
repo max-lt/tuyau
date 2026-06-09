@@ -53,11 +53,29 @@ pub struct AcmeSection {
     pub production: bool,
 }
 
+/// How the server treats multiple concurrent tunnels authenticating as the
+/// same client identity (same token).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Balance {
+    /// The newest tunnel replaces the previous one for that client's
+    /// hostnames; the old connection is closed. Good for reconnects.
+    #[default]
+    LastWriteWins,
+    /// Every concurrent tunnel for the client stays registered and public
+    /// connections are spread across them round-robin. Active-active fan-out.
+    RoundRobin,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientEntry {
     pub name: String,
     #[serde(deserialize_with = "deserialize_token_hex")]
     pub token: [u8; 32],
+    /// Behaviour when several tunnels share this client's token. Defaults to
+    /// `last-write-wins`.
+    #[serde(default)]
+    pub balance: Balance,
 }
 
 #[derive(Debug, Clone, Deserialize)]
