@@ -43,6 +43,31 @@ fn load(cert_path: &Path, key_path: &Path) -> Result<CertMaterial, CertError> {
     })
 }
 
+/// Load a full PEM certificate chain (leaf first, then intermediates) and its
+/// private key, for serving an externally-obtained cert (e.g. Let's Encrypt via
+/// DNS-01) on the public listener. Unlike [`read_first_cert`], the whole chain
+/// is kept so browsers can build a trusted path. The key may be PKCS#8, PKCS#1
+/// (RSA) or SEC1 (EC) — `private_key` auto-detects.
+pub fn load_chain(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), CertError> {
+    let cert_file = fs::File::open(cert_path)?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let chain: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader).collect::<Result<_, _>>()?;
+    if chain.is_empty() {
+        return Err(CertError::PemNoCert(cert_path.display().to_string()));
+    }
+
+    let key_file = fs::File::open(key_path)?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| CertError::PemNoKey(key_path.display().to_string()))?;
+
+    Ok((chain, key))
+}
+
 fn read_first_cert(path: &Path) -> Result<CertificateDer<'static>, CertError> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);

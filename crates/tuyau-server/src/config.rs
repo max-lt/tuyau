@@ -23,6 +23,16 @@ pub struct ServerConfig {
     /// `terminated` hostnames only — passthrough never needs a cert.
     #[serde(default)]
     pub acme: Option<AcmeSection>,
+    /// Optional path to a PEM certificate chain (leaf first) for the public
+    /// listener. When set — and `acme` is not — the listener serves this cert
+    /// for all terminated hostnames instead of a self-signed one. Useful for a
+    /// cert obtained out-of-band (e.g. Let's Encrypt via DNS-01) when inbound
+    /// TLS-ALPN-01 validation isn't possible. Requires `tls_key_file` too.
+    #[serde(default)]
+    pub tls_cert_file: Option<PathBuf>,
+    /// Private key (PEM) matching `tls_cert_file`.
+    #[serde(default)]
+    pub tls_key_file: Option<PathBuf>,
 }
 
 /// ACME / Let's Encrypt parameters. The default `directory_url` points at LE

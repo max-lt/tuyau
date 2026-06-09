@@ -77,6 +77,8 @@ impl TunnelServer {
 
                 let (resolver, acme_handle) = build_cert_resolver(
                     &config.acme,
+                    &config.tls_cert_file,
+                    &config.tls_key_file,
                     &terminated_hostnames,
                     &cert_dir,
                     cancel.clone(),
@@ -170,6 +172,8 @@ type ResolverBundle = (Arc<dyn ResolvesServerCert>, Option<JoinHandle<()>>);
 /// otherwise.
 fn build_cert_resolver(
     acme: &Option<AcmeSection>,
+    tls_cert_file: &Option<std::path::PathBuf>,
+    tls_key_file: &Option<std::path::PathBuf>,
     terminated_hostnames: &[String],
     cert_dir: &std::path::Path,
     cancel: CancellationToken,
@@ -184,8 +188,29 @@ fn build_cert_resolver(
             return Ok((resolver, Some(handle)));
         }
     }
+    // Static cert (e.g. obtained out-of-band via DNS-01). Takes precedence over
+    // the self-signed fallback when both cert and key paths are configured.
+    if let (Some(cert_file), Some(key_file)) = (tls_cert_file, tls_key_file) {
+        let (chain, key) = cert::load_chain(cert_file, key_file)?;
+        tracing::info!(
+            cert = %cert_file.display(),
+            chain_len = chain.len(),
+            "serving static TLS cert on public listener"
+        );
+        return Ok((build_static_chain_resolver(chain, key)?, None));
+    }
     let public_cert = cert::generate_public_cert(terminated_hostnames, cert_dir)?;
     Ok((build_static_resolver(public_cert)?, None))
+}
+
+fn build_static_chain_resolver(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<Arc<dyn ResolvesServerCert>, ServerError> {
+    let signing_key =
+        rustls::crypto::ring::sign::any_supported_type(&key).map_err(ServerError::Tls)?;
+    let certified = CertifiedKey::new(chain, signing_key);
+    Ok(Arc::new(StaticResolver(Arc::new(certified))))
 }
 
 fn build_static_resolver(
