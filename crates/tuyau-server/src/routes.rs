@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -14,12 +15,22 @@ pub struct RouteEntry {
     pub conn: quinn::Connection,
 }
 
+/// The destination of a local upstream: a TCP address or a Unix socket path.
+#[derive(Debug, Clone)]
+pub enum UpstreamTarget {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
 /// Where a hostname's public traffic goes: a client tunnel, or a static local
 /// upstream the server forwards to directly.
 #[derive(Debug, Clone)]
 pub enum Route {
     Tunnel(RouteEntry),
-    Local { addr: SocketAddr, tls_mode: TlsMode },
+    Local {
+        target: UpstreamTarget,
+        tls_mode: TlsMode,
+    },
 }
 
 impl Route {
@@ -32,9 +43,9 @@ impl Route {
 }
 
 /// A static local upstream resolved for a hostname (from [`UpstreamEntry`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LocalUpstream {
-    addr: SocketAddr,
+    target: UpstreamTarget,
     tls_mode: TlsMode,
 }
 
@@ -60,18 +71,25 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
-    /// Build a table with static local upstreams installed.
+    /// Build a table with static local upstreams installed. Config validation
+    /// guarantees each entry names exactly one target; an entry with neither is
+    /// defensively skipped.
     pub fn with_upstreams(upstreams: &[UpstreamEntry]) -> Self {
         let local = upstreams
             .iter()
-            .map(|u| {
-                (
+            .filter_map(|u| {
+                let target = match (&u.local_socket, u.local_addr) {
+                    (Some(path), _) => UpstreamTarget::Unix(path.clone()),
+                    (None, Some(addr)) => UpstreamTarget::Tcp(addr),
+                    (None, None) => return None,
+                };
+                Some((
                     u.host.clone(),
                     LocalUpstream {
-                        addr: u.local_addr,
+                        target,
                         tls_mode: u.tls_mode,
                     },
-                )
+                ))
             })
             .collect();
         Self {
@@ -208,7 +226,7 @@ impl RoutingTable {
     pub fn lookup(&self, host: &str) -> Option<Route> {
         if let Some(up) = self.local.get(host) {
             return Some(Route::Local {
-                addr: up.addr,
+                target: up.target.clone(),
                 tls_mode: up.tls_mode,
             });
         }

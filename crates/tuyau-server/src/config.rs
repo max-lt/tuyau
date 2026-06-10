@@ -107,7 +107,14 @@ pub struct HostnameEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamEntry {
     pub host: String,
-    pub local_addr: SocketAddr,
+    /// Forward to a local TCP address. Exactly one of `local_addr` /
+    /// `local_socket` must be set.
+    #[serde(default)]
+    pub local_addr: Option<SocketAddr>,
+    /// Forward to a local Unix domain socket (e.g. `/run/tuyau/app.sock`).
+    /// Exactly one of `local_addr` / `local_socket` must be set.
+    #[serde(default)]
+    pub local_socket: Option<PathBuf>,
     #[serde(default)]
     pub tls_mode: TlsMode,
 }
@@ -147,6 +154,7 @@ impl ServerConfig {
                 return Err(ConfigError::DuplicateHost(u.host.clone()));
             }
         }
+        self.validate_upstream_targets()?;
 
         let known_clients: HashSet<&str> = self.clients.iter().map(|c| c.name.as_str()).collect();
         for h in &self.hostnames {
@@ -174,7 +182,19 @@ impl ServerConfig {
                 return Err(ConfigError::DuplicateHost(u.host.clone()));
             }
         }
+        self.validate_upstream_targets()?;
         self.validate_acme()
+    }
+
+    /// Each upstream must name exactly one target: a TCP `local_addr` or a Unix
+    /// `local_socket`, never both and never neither.
+    fn validate_upstream_targets(&self) -> Result<(), ConfigError> {
+        for u in &self.upstreams {
+            if u.local_addr.is_some() == u.local_socket.is_some() {
+                return Err(ConfigError::UpstreamTarget(u.host.clone()));
+            }
+        }
+        Ok(())
     }
 
     fn validate_acme(&self) -> Result<(), ConfigError> {

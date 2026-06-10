@@ -43,6 +43,9 @@ pub enum ConfigError {
 
     #[error("acme.contact must be a mailto: URL, got '{0}'")]
     AcmeContact(String),
+
+    #[error("upstream '{0}' must set exactly one of local_addr / local_socket")]
+    UpstreamTarget(String),
 }
 
 #[derive(Debug, Error)]

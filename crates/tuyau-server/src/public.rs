@@ -16,6 +16,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -25,7 +26,7 @@ use futures_util::SinkExt;
 use rustls::ServerConfig as RustlsServerConfig;
 use rustls::server::ResolvesServerCert;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_rustls::LazyConfigAcceptor;
@@ -35,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tuyau_protocol::{DataStreamHeader, FrameCodec, TlsMode};
 
 use crate::error::ServerError;
-use crate::routes::{Route, RouteEntry, RoutingTable};
+use crate::routes::{Route, RouteEntry, RoutingTable, UpstreamTarget};
 use crate::sni::parse_sni;
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -179,16 +180,23 @@ async fn handle_public(
         }
     };
     let tls_mode = route.tls_mode();
-    let target = match &route {
+    let route_desc = match &route {
         Route::Tunnel(e) => format!("tunnel:{}", e.client_name),
-        Route::Local { addr, .. } => format!("local:{addr}"),
+        Route::Local {
+            target: UpstreamTarget::Tcp(a),
+            ..
+        } => format!("local:{a}"),
+        Route::Local {
+            target: UpstreamTarget::Unix(p),
+            ..
+        } => format!("local:{}", p.display()),
     };
 
     tracing::info!(
         peer = %peer,
         sni = %sni,
         mode = ?tls_mode,
-        target = %target,
+        target = %route_desc,
         "public connection routed"
     );
 
@@ -239,10 +247,8 @@ async fn handle_public(
                     };
                     pipe_bytes(tls_stream, send, recv).await;
                 }
-                Route::Local { addr, .. } => {
-                    if let Some(upstream) = connect_local(addr, &sni, peer).await {
-                        splice_local(tls_stream, upstream).await;
-                    }
+                Route::Local { target, .. } => {
+                    dispatch_local(tls_stream, &target, &sni, peer).await;
                 }
             }
         }
@@ -259,10 +265,8 @@ async fn handle_public(
                     };
                     pipe_bytes(prefixed, send, recv).await;
                 }
-                Route::Local { addr, .. } => {
-                    if let Some(upstream) = connect_local(addr, &sni, peer).await {
-                        splice_local(prefixed, upstream).await;
-                    }
+                Route::Local { target, .. } => {
+                    dispatch_local(prefixed, &target, &sni, peer).await;
                 }
             }
         }
@@ -271,8 +275,29 @@ async fn handle_public(
     Ok(())
 }
 
-/// Dial a static local upstream, with a timeout. `None` on failure (logged).
-async fn connect_local(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<TcpStream> {
+/// Connect to a local upstream's target and splice the public-side stream to it.
+/// Generic over the public stream so both terminated TLS streams and raw
+/// passthrough streams reuse it.
+async fn dispatch_local<S>(public_stream: S, target: &UpstreamTarget, sni: &str, peer: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match target {
+        UpstreamTarget::Tcp(addr) => {
+            if let Some(up) = connect_tcp(*addr, sni, peer).await {
+                splice_local(public_stream, up).await;
+            }
+        }
+        UpstreamTarget::Unix(path) => {
+            if let Some(up) = connect_unix(path, sni, peer).await {
+                splice_local(public_stream, up).await;
+            }
+        }
+    }
+}
+
+/// Dial a local upstream over TCP, with a timeout. `None` on failure (logged).
+async fn connect_tcp(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<TcpStream> {
     match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => Some(s),
         Ok(Err(e)) => {
@@ -281,6 +306,22 @@ async fn connect_local(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<
         }
         Err(_) => {
             tracing::warn!(peer = %peer, sni = %sni, %addr, "local upstream connect timeout");
+            None
+        }
+    }
+}
+
+/// Dial a local upstream over a Unix domain socket, with a timeout. `None` on
+/// failure (logged).
+async fn connect_unix(path: &Path, sni: &str, peer: SocketAddr) -> Option<UnixStream> {
+    match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(s)) => Some(s),
+        Ok(Err(e)) => {
+            tracing::warn!(peer = %peer, sni = %sni, socket = %path.display(), error = %e, "local upstream connect failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer, sni = %sni, socket = %path.display(), "local upstream connect timeout");
             None
         }
     }

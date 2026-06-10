@@ -348,7 +348,8 @@ async fn local_upstream_passthrough_forwards_to_local_service() {
         hostnames: vec![],
         upstreams: vec![UpstreamEntry {
             host: "front.example.com".into(),
-            local_addr,
+            local_addr: Some(local_addr),
+            local_socket: None,
             tls_mode: TlsMode::Passthrough,
         }],
     };
@@ -365,6 +366,91 @@ async fn local_upstream_passthrough_forwards_to_local_service() {
     assert!(
         resp.starts_with(b"HTTP/1.1 200 OK"),
         "non-200 on local upstream: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(http_body(&resp), body.as_slice());
+
+    server.shutdown().await;
+}
+
+/// Like `spawn_local_http` but bound to a Unix domain socket — for the
+/// upstream-to-socket path (how tuyau fronts its own local services).
+async fn spawn_local_http_unix(path: std::path::PathBuf, body: Arc<Vec<u8>>) {
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&tmp[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len(),
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+}
+
+#[tokio::test]
+async fn local_upstream_unix_socket_terminated_forwards_to_service() {
+    // The dogfood path: tuyau terminates TLS and forwards plaintext HTTP to a
+    // local service on a Unix socket — exactly how it'll front its own console
+    // and tenant app (each a SvelteKit node server on a socket).
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("upstream.sock");
+    let body = Arc::new(b"from-unix-socket".to_vec());
+    spawn_local_http_unix(sock.clone(), Arc::clone(&body)).await;
+
+    let cert_dir = TempDir::new().unwrap();
+    let cfg = ServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+        tunnel_cert_dir: Some(cert_dir.path().to_path_buf()),
+        acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
+        max_public_connections: None,
+        clients: vec![],
+        hostnames: vec![],
+        upstreams: vec![UpstreamEntry {
+            host: "front.example.com".into(),
+            local_addr: None,
+            local_socket: Some(sock),
+            tls_mode: TlsMode::Terminated,
+        }],
+    };
+    let server = TunnelServer::start(cfg).await.unwrap();
+
+    let public_addr = server.public_local_addr().unwrap();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        http_get(public_addr, "front.example.com"),
+    )
+    .await
+    .expect("unix-socket upstream response within 5s");
+
+    assert!(
+        resp.starts_with(b"HTTP/1.1 200 OK"),
+        "non-200 on unix upstream: {:?}",
         String::from_utf8_lossy(&resp)
     );
     assert_eq!(http_body(&resp), body.as_slice());

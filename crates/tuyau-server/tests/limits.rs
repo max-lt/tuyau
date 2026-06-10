@@ -25,7 +25,8 @@ async fn public_connection_cap_sheds_excess() {
         // dialed here (the test connections never send a ClientHello).
         upstreams: vec![UpstreamEntry {
             host: "front.example.com".into(),
-            local_addr: "127.0.0.1:9".parse().unwrap(),
+            local_addr: Some("127.0.0.1:9".parse().unwrap()),
+            local_socket: None,
             tls_mode: TlsMode::Passthrough,
         }],
         max_public_connections: Some(1),
