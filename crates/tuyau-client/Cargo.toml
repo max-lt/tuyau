@@ -20,20 +20,30 @@ subtle = { workspace = true }
 sha2 = { workspace = true }
 pin-project-lite = { workspace = true }
 axum = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enables `impl axum::serve::Listener for TunnelListener`, the drop-in adapter
 # for embedding the tunnel into an existing axum/hyper HTTP application.
 axum = ["dep:axum"]
+# Enables `TlsTunnelListener` / `TunnelClient::tls_listener`: terminate TLS over
+# the tunnel with the app's own cert (passthrough mode). Pairs with `axum` for
+# the `axum::serve` one-liner.
+tls = ["dep:tokio-rustls"]
 
 [[example]]
 name = "axum"
 required-features = ["axum"]
 
+[[example]]
+name = "passthrough"
+required-features = ["tls", "axum"]
+
 [dev-dependencies]
 tuyau-server = { workspace = true }
 tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tempfile = { workspace = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
