@@ -22,6 +22,7 @@ async fn end_to_end_handshake() {
         tls_cert_file: None,
         tls_key_file: None,
         max_public_connections: None,
+        error_502_file: None,
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),

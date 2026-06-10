@@ -30,6 +30,7 @@ async fn public_connection_cap_sheds_excess() {
             tls_mode: TlsMode::Passthrough,
         }],
         max_public_connections: Some(1),
+        error_502_file: None,
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();

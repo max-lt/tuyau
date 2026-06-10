@@ -59,6 +59,7 @@ pub(crate) async fn start(
     acme_active: bool,
     routes: RoutingTable,
     max_conns: usize,
+    error_502: Arc<str>,
     cancel: CancellationToken,
 ) -> Result<PublicListenerHandle, ServerError> {
     let listener = TcpListener::bind(listen_addr).await?;
@@ -67,7 +68,15 @@ pub(crate) async fn start(
     let rustls_config = Arc::new(build_rustls_config(cert_resolver, acme_active)?);
 
     let join = tokio::spawn(async move {
-        accept_loop(listener, rustls_config, routes, max_conns, cancel).await;
+        accept_loop(
+            listener,
+            rustls_config,
+            routes,
+            max_conns,
+            error_502,
+            cancel,
+        )
+        .await;
     });
 
     Ok(PublicListenerHandle { local_addr, join })
@@ -107,6 +116,7 @@ async fn accept_loop(
     rustls_config: Arc<RustlsServerConfig>,
     routes: RoutingTable,
     max_conns: usize,
+    error_502: Arc<str>,
     cancel: CancellationToken,
 ) {
     // Bounds the number of public connections handled at once. A permit is held
@@ -138,9 +148,10 @@ async fn accept_loop(
                 };
                 let rustls_config = rustls_config.clone();
                 let routes = routes.clone();
+                let error_502 = error_502.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // released when this connection ends
-                    if let Err(e) = handle_public(stream, peer, rustls_config, routes).await {
+                    if let Err(e) = handle_public(stream, peer, rustls_config, routes, error_502).await {
                         tracing::warn!(peer = %peer, error = %e, "public connection error");
                     }
                 });
@@ -154,6 +165,7 @@ async fn handle_public(
     peer: SocketAddr,
     rustls_config: Arc<RustlsServerConfig>,
     routes: RoutingTable,
+    error_502: Arc<str>,
 ) -> io::Result<()> {
     // 1. Read the ClientHello record off the wire (NOT peeking — consumed
     //    bytes are replayed below via PrefixedStream so both terminated and
@@ -221,7 +233,7 @@ async fn handle_public(
             }
             None => {
                 tracing::info!(peer = %peer, sni = %sni, "terminated, no live route — serving 502");
-                write_502(tls_stream).await;
+                write_502(tls_stream, &error_502).await;
             }
         }
     } else {
@@ -300,17 +312,20 @@ async fn connect_unix(path: &Path, sni: &str, peer: SocketAddr) -> Option<UnixSt
     }
 }
 
+/// The built-in 502 page, served when a deployment doesn't supply its own via
+/// [`ServerConfig::error_502_file`](crate::config::ServerConfig::error_502_file).
+pub(crate) const DEFAULT_502_HTML: &str = include_str!("502.html");
+
 /// Write a friendly HTTP 502 on a terminated (already-decrypted) stream when the
 /// hostname is configured but no backend is currently serving it. Only possible
 /// in terminated mode — passthrough never decrypts, so it can only drop.
-async fn write_502<S: AsyncWrite + Unpin>(mut stream: S) {
-    const BODY: &str = include_str!("502.html");
+async fn write_502<S: AsyncWrite + Unpin>(mut stream: S, body: &str) {
     let resp = format!(
         "HTTP/1.1 502 Bad Gateway\r\n\
          content-type: text/html; charset=utf-8\r\n\
          content-length: {}\r\n\
-         connection: close\r\n\r\n{BODY}",
-        BODY.len()
+         connection: close\r\n\r\n{body}",
+        body.len()
     );
     let _ = stream.write_all(resp.as_bytes()).await;
     let _ = stream.flush().await;

@@ -141,12 +141,25 @@ impl TunnelServer {
                 let max_conns = config
                     .max_public_connections
                     .unwrap_or(public::DEFAULT_MAX_PUBLIC_CONNECTIONS);
+                // A deployment can brand the 502 page (e.g. add a dashboard
+                // link); fall back to the built-in if unset or unreadable.
+                let error_502: Arc<str> = match &config.error_502_file {
+                    Some(path) => match std::fs::read_to_string(path) {
+                        Ok(html) => Arc::from(html),
+                        Err(e) => {
+                            tracing::warn!(error = %e, path = %path.display(), "error_502_file unreadable, using built-in");
+                            Arc::from(public::DEFAULT_502_HTML)
+                        }
+                    },
+                    None => Arc::from(public::DEFAULT_502_HTML),
+                };
                 let handle = public::start(
                     addr,
                     resolver,
                     acme_active,
                     routes.clone(),
                     max_conns,
+                    error_502,
                     cancel.clone(),
                 )
                 .await

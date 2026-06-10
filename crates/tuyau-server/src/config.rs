@@ -44,6 +44,11 @@ pub struct ServerConfig {
     /// (1024). Only relevant when `public_listen_addr` is set.
     #[serde(default)]
     pub max_public_connections: Option<usize>,
+    /// Path to a custom HTML page served as the 502 body when a terminated
+    /// hostname has no live backend. `None` uses the built-in default. Lets a
+    /// deployment brand it (e.g. add a dashboard link).
+    #[serde(default)]
+    pub error_502_file: Option<PathBuf>,
 }
 
 /// ACME / Let's Encrypt parameters. The default `directory_url` points at LE
