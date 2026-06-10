@@ -330,3 +330,55 @@ async fn observe_reports_tunnel_up_and_down() {
     endpoint.close(0u32.into(), b"done");
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn kick_revokes_a_connected_client() {
+    let dir = TempDir::new().unwrap();
+    let server = TunnelServer::start_with(
+        Arc::new(OneToken {
+            token: [7u8; 32],
+            host: "x.example".into(),
+        }),
+        dyn_cfg(&dir),
+    )
+    .await
+    .unwrap();
+    let mut events = server.subscribe();
+    let addr = server.local_addr().unwrap();
+    let endpoint = client_endpoint();
+
+    let (conn, resp) = connect_and_hello(addr, &endpoint, [7u8; 32]).await;
+    assert!(matches!(resp, HelloResponse::Welcome));
+    // Consume the TunnelUp.
+    let _ = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(server.tunnels().len(), 1);
+
+    // Revoke: closes the tunnel now and reports one connection closed.
+    assert_eq!(server.kick("dyn"), 1, "one connection revoked");
+
+    // The client's connection is closed and a TunnelDown surfaces.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .is_ok(),
+        "revoked connection was closed"
+    );
+    let down = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(down, ControlEvent::TunnelDown { ref client_name, .. } if client_name == "dyn"),
+        "expected TunnelDown for dyn, got {down:?}"
+    );
+    assert!(server.tunnels().is_empty(), "registry cleared after revoke");
+
+    // Kicking an unknown client is a no-op.
+    assert_eq!(server.kick("nobody"), 0);
+
+    endpoint.close(0u32.into(), b"done");
+    server.shutdown().await;
+}

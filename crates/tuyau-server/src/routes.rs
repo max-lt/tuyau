@@ -119,6 +119,29 @@ impl RoutingTable {
         });
     }
 
+    /// Remove every hostname owned by `client_name` and return that client's
+    /// unique connections (deduplicated, since one tunnel can serve several
+    /// hosts) so the caller can close them. Used for control-plane revocation.
+    #[cfg(feature = "dynamic")]
+    pub fn kick(&self, client_name: &str) -> Vec<quinn::Connection> {
+        let mut guard = self.inner.write().expect("routes lock poisoned");
+        let mut conns: Vec<quinn::Connection> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        guard.retain(|_, entry| {
+            if entry.client_name == client_name {
+                for c in &entry.conns {
+                    if seen.insert(c.stable_id()) {
+                        conns.push(c.clone());
+                    }
+                }
+                false // drop this host entry
+            } else {
+                true
+            }
+        });
+        conns
+    }
+
     /// Sorted snapshot of currently active hostnames (those with ≥1 tunnel).
     pub fn active_hostnames(&self) -> Vec<String> {
         let guard = self.inner.read().expect("routes lock poisoned");

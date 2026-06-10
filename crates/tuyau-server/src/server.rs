@@ -211,6 +211,21 @@ impl TunnelServer {
         self.control.subscribe()
     }
 
+    /// Revoke a client: close all of its connected tunnels now. Returns the
+    /// number of connections closed. Each closed tunnel surfaces a `TunnelDown`
+    /// event once its handler observes the close. This only terminates *current*
+    /// tunnels — to prevent reconnection the [`RoutingBackend`] must also stop
+    /// admitting the client. Behind the `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn kick(&self, client_name: &str) -> usize {
+        let conns = self.routes.kick(client_name);
+        let n = conns.len();
+        for c in conns {
+            c.close(0u32.into(), b"revoked");
+        }
+        n
+    }
+
     pub async fn shutdown(self) {
         self.cancel.cancel();
         self.endpoint.close(0u32.into(), b"server shutdown");
