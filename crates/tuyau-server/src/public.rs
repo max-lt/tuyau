@@ -220,7 +220,8 @@ async fn handle_public(
                 dispatch_local(tls_stream, &target, &sni, peer).await;
             }
             None => {
-                tracing::info!(peer = %peer, sni = %sni, "terminated cert served but no live route (agent offline?)");
+                tracing::info!(peer = %peer, sni = %sni, "terminated, no live route — serving 502");
+                write_502(tls_stream).await;
             }
         }
     } else {
@@ -297,6 +298,23 @@ async fn connect_unix(path: &Path, sni: &str, peer: SocketAddr) -> Option<UnixSt
             None
         }
     }
+}
+
+/// Write a friendly HTTP 502 on a terminated (already-decrypted) stream when the
+/// hostname is configured but no backend is currently serving it. Only possible
+/// in terminated mode — passthrough never decrypts, so it can only drop.
+async fn write_502<S: AsyncWrite + Unpin>(mut stream: S) {
+    const BODY: &str = include_str!("502.html");
+    let resp = format!(
+        "HTTP/1.1 502 Bad Gateway\r\n\
+         content-type: text/html; charset=utf-8\r\n\
+         content-length: {}\r\n\
+         connection: close\r\n\r\n{BODY}",
+        BODY.len()
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
 }
 
 /// Splice a public-side stream to a local upstream, copying both directions
