@@ -123,11 +123,21 @@ impl RoutingTable {
         if n == 0 {
             return None;
         }
-        let idx = entry.cursor.fetch_add(1, Ordering::Relaxed) % n;
-        Some(RouteEntry {
-            client_name: entry.client_name.clone(),
-            tls_mode: entry.tls_mode,
-            conn: entry.conns[idx].clone(),
-        })
+        // Round-robin, but skip connections already known closed (their owning
+        // handler removes them shortly; this just avoids dispatching to a corpse
+        // in the meantime). Try at most one full cycle; if every connection is
+        // dead, drop rather than return one.
+        for _ in 0..n {
+            let idx = entry.cursor.fetch_add(1, Ordering::Relaxed) % n;
+            let conn = &entry.conns[idx];
+            if conn.close_reason().is_none() {
+                return Some(RouteEntry {
+                    client_name: entry.client_name.clone(),
+                    tls_mode: entry.tls_mode,
+                    conn: conn.clone(),
+                });
+            }
+        }
+        None
     }
 }

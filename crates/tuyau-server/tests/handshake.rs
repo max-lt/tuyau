@@ -197,6 +197,48 @@ async fn reject_on_malformed_bytes() {
 }
 
 #[tokio::test]
+async fn server_closes_rejected_client() {
+    // A rejected (unauthenticated) connection must be closed by the server, not
+    // parked open — otherwise a peer that completes the handshake but never
+    // closes accumulates indefinitely (keep-alives hold off the idle timeout).
+    let (server, _dir) = spin_up_server().await;
+    let server_addr = server.local_addr().unwrap();
+    let endpoint = make_client_endpoint(ALPN);
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+
+    let (send, recv) = connection.open_bi().await.unwrap();
+    let mut writer = FramedWrite::new(send, FrameCodec::<Hello>::new());
+    let mut reader = FramedRead::new(recv, FrameCodec::<HelloResponse>::new());
+    writer
+        .send(Hello {
+            token: WRONG_TOKEN,
+            client_name: "evil".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        reader.next().await.unwrap().unwrap(),
+        HelloResponse::Reject { .. }
+    ));
+
+    // The server must close it on its own, well under MAX_IDLE — the test does
+    // NOT close it. Without the fix the connection is parked and `closed()`
+    // would not resolve until the idle timeout.
+    let closed = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
+    assert!(
+        closed.is_ok(),
+        "server parked the rejected connection instead of closing it"
+    );
+
+    endpoint.close(0u32.into(), b"test done");
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn server_closes_silent_client() {
     let (server, _dir) = spin_up_server().await;
     let server_addr = server.local_addr().unwrap();

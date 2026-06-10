@@ -17,8 +17,12 @@ use crate::verifier::PinningCertVerifier;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const KEEP_ALIVE: Duration = Duration::from_secs(15);
-const MAX_IDLE: Duration = Duration::from_secs(60);
+// Mirror the server's tunnel-liveness values (tuyau-server src/server.rs): a
+// short MAX_IDLE bounds how fast either side detects the other going silent,
+// and KEEP_ALIVE sits well under it so a healthy tunnel is never falsely
+// dropped.
+const KEEP_ALIVE: Duration = Duration::from_secs(7);
+const MAX_IDLE: Duration = Duration::from_secs(20);
 
 /// An accepted server-initiated bidi stream, with its `DataStreamHeader` read
 /// and the raw quinn streams ready for byte-level forwarding.

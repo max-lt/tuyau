@@ -23,8 +23,18 @@ use crate::public;
 use crate::routes::RoutingTable;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-const KEEP_ALIVE: Duration = Duration::from_secs(15);
-const MAX_IDLE: Duration = Duration::from_secs(60);
+// Tunnel liveness. A silently-dead tunnel (killed process, severed network) is
+// detected only once MAX_IDLE elapses with no packets received, so MAX_IDLE
+// bounds how long a dead round-robin member stays in rotation. KEEP_ALIVE must
+// sit comfortably below the peer's MAX_IDLE (the client mirrors these values)
+// so a healthy tunnel is never falsely dropped — here ~3 keep-alives fit in one
+// idle window.
+const KEEP_ALIVE: Duration = Duration::from_secs(7);
+const MAX_IDLE: Duration = Duration::from_secs(20);
+// How long to keep a rejected connection open so its reject frame can flush and
+// the peer can close, before force-closing it. Bounds the resource a peer that
+// never closes can pin (it must not be held until MAX_IDLE).
+const REJECT_LINGER: Duration = Duration::from_secs(2);
 
 pub struct TunnelServer {
     endpoint: Endpoint,
@@ -467,6 +477,7 @@ async fn handle_incoming(
         }
     };
 
+    // Stream closed before a hello arrived — nothing was sent; just drop.
     if matches!(outcome, Outcome::NoResponse) {
         return Ok(());
     }
@@ -475,8 +486,20 @@ async fn handle_incoming(
     let mut send = writer.into_inner();
     let _ = send.finish();
 
-    // Hold the connection open until the peer closes it or we cancel. The QUIC
-    // idle timeout (max_idle_timeout) is the safety-net if the peer abandons.
+    // A reject was sent. Wait for the peer to read it and close, but only up to
+    // REJECT_LINGER, then force-close. Parking a rejected (i.e. unauthenticated)
+    // connection until the QUIC idle timeout lets a peer that never closes pin
+    // server resources without a token; the linger still lets the reject frame
+    // flush to a well-behaved peer.
+    if matches!(outcome, Outcome::Reject) {
+        let _ = tokio::time::timeout(REJECT_LINGER, connection.closed()).await;
+        connection.close(1u32.into(), b"rejected");
+        return Ok(());
+    }
+
+    // Authenticated tunnel (Outcome::Welcome): hold the connection open until the
+    // peer closes it or we cancel. The QUIC idle timeout is the safety-net if
+    // the peer abandons it.
     let stable_id = connection.stable_id();
     tokio::select! {
         _ = cancel.cancelled() => {
@@ -487,9 +510,6 @@ async fn handle_incoming(
         }
     }
 
-    if matches!(outcome, Outcome::Welcome) {
-        routes.remove_conn(stable_id);
-    }
-
+    routes.remove_conn(stable_id);
     Ok(())
 }
