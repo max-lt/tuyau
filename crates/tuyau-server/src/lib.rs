@@ -10,7 +10,9 @@ mod routes;
 mod server;
 mod sni;
 
-pub use config::{Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, UpstreamEntry};
+pub use config::{
+    AcmeSection, Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, UpstreamEntry,
+};
 pub use error::{CertError, ConfigError, ServerError};
 pub use server::TunnelServer;
 
