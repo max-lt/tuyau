@@ -38,6 +38,12 @@ pub struct ServerConfig {
     /// default; valid in both static and dynamic mode.
     #[serde(default)]
     pub upstreams: Vec<UpstreamEntry>,
+    /// Cap on concurrent public connections being handled. Beyond it, new public
+    /// connections are shed (accepted then closed at once) so a flood can't grow
+    /// tasks / memory / file descriptors without bound. `None` uses the default
+    /// (1024). Only relevant when `public_listen_addr` is set.
+    #[serde(default)]
+    pub max_public_connections: Option<usize>,
 }
 
 /// ACME / Let's Encrypt parameters. The default `directory_url` points at LE

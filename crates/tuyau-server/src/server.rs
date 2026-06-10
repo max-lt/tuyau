@@ -124,11 +124,15 @@ impl TunnelServer {
                 )?;
                 let acme_active = acme_handle.is_some();
 
+                let max_conns = config
+                    .max_public_connections
+                    .unwrap_or(public::DEFAULT_MAX_PUBLIC_CONNECTIONS);
                 let handle = public::start(
                     addr,
                     resolver,
                     acme_active,
                     routes.clone(),
+                    max_conns,
                     cancel.clone(),
                 )
                 .await

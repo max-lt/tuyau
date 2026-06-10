@@ -26,6 +26,7 @@ use rustls::ServerConfig as RustlsServerConfig;
 use rustls::server::ResolvesServerCert;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, split};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_rustls::LazyConfigAcceptor;
 use tokio_util::codec::FramedWrite;
@@ -42,6 +43,10 @@ const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECORD_SIZE: usize = 16 * 1024;
 
+/// Default cap on concurrent public connections being handled (overridable via
+/// `ServerConfig::max_public_connections`). Bounds memory / FDs under a flood.
+pub(crate) const DEFAULT_MAX_PUBLIC_CONNECTIONS: usize = 1024;
+
 pub(crate) struct PublicListenerHandle {
     pub local_addr: SocketAddr,
     pub join: JoinHandle<()>,
@@ -52,6 +57,7 @@ pub(crate) async fn start(
     cert_resolver: Arc<dyn ResolvesServerCert>,
     acme_active: bool,
     routes: RoutingTable,
+    max_conns: usize,
     cancel: CancellationToken,
 ) -> Result<PublicListenerHandle, ServerError> {
     let listener = TcpListener::bind(listen_addr).await?;
@@ -60,7 +66,7 @@ pub(crate) async fn start(
     let rustls_config = Arc::new(build_rustls_config(cert_resolver, acme_active)?);
 
     let join = tokio::spawn(async move {
-        accept_loop(listener, rustls_config, routes, cancel).await;
+        accept_loop(listener, rustls_config, routes, max_conns, cancel).await;
     });
 
     Ok(PublicListenerHandle { local_addr, join })
@@ -99,8 +105,13 @@ async fn accept_loop(
     listener: TcpListener,
     rustls_config: Arc<RustlsServerConfig>,
     routes: RoutingTable,
+    max_conns: usize,
     cancel: CancellationToken,
 ) {
+    // Bounds the number of public connections handled at once. A permit is held
+    // for a connection's whole lifetime; when none are free, new connections are
+    // shed rather than queued, so a flood can't grow tasks/memory without bound.
+    let limiter = Arc::new(Semaphore::new(max_conns));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -115,9 +126,19 @@ async fn accept_loop(
                         continue;
                     }
                 };
+                let permit = match limiter.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // At capacity: drop the stream (closes it) and move on.
+                        tracing::debug!(peer = %peer, "public connection cap reached, shedding");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let rustls_config = rustls_config.clone();
                 let routes = routes.clone();
                 tokio::spawn(async move {
+                    let _permit = permit; // released when this connection ends
                     if let Err(e) = handle_public(stream, peer, rustls_config, routes).await {
                         tracing::warn!(peer = %peer, error = %e, "public connection error");
                     }

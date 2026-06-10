@@ -11,8 +11,14 @@
 //! not handled here; both are extremely rare in browser-like clients and we
 //! deliberately keep the parser small enough to audit at a glance.
 
+/// Maximum SNI host_name length we accept. A DNS name is at most 253 bytes;
+/// anything longer isn't a real hostname, so we reject it rather than route on
+/// (or allocate) a pathological string from a hostile ClientHello.
+const MAX_SNI_LEN: usize = 253;
+
 /// Returns the SNI host_name if the bytes look like a valid ClientHello with
-/// an SNI extension; `None` otherwise.
+/// an SNI extension; `None` otherwise. Never panics on arbitrary input — every
+/// read is bounds-checked and every advance is `checked_add`.
 pub(crate) fn parse_sni(buf: &[u8]) -> Option<String> {
     let mut p = 0usize;
 
@@ -71,7 +77,10 @@ pub(crate) fn parse_sni(buf: &[u8]) -> Option<String> {
                     return None;
                 }
                 if name_type == 0x00 {
-                    // host_name
+                    // host_name — reject implausibly long names (not a hostname).
+                    if name_len > MAX_SNI_LEN {
+                        return None;
+                    }
                     return std::str::from_utf8(&buf[q..name_end])
                         .ok()
                         .map(String::from);
@@ -194,6 +203,60 @@ mod tests {
     #[test]
     fn returns_none_on_empty_buffer() {
         assert_eq!(parse_sni(&[]), None);
+    }
+
+    /// Tiny deterministic PRNG (no rng dependency) for fuzz-style inputs.
+    fn lcg(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as u8
+    }
+
+    #[test]
+    fn never_panics_on_truncations() {
+        let full = craft_client_hello_with_sni("alpha.example.com");
+        for len in 0..=full.len() {
+            let _ = parse_sni(&full[..len]); // must not panic at any prefix
+        }
+    }
+
+    #[test]
+    fn never_panics_on_single_byte_mutations() {
+        let base = craft_client_hello_with_sni("alpha.example.com");
+        for i in 0..base.len() {
+            for b in [0x00u8, 0x01, 0x16, 0x7f, 0xff] {
+                let mut m = base.clone();
+                m[i] = b;
+                let _ = parse_sni(&m);
+            }
+        }
+    }
+
+    #[test]
+    fn never_panics_on_random_and_semi_valid_buffers() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for len in [0usize, 1, 2, 5, 9, 16, 64, 256, 1024, 16384] {
+            for _ in 0..100 {
+                // Fully random bytes.
+                let buf: Vec<u8> = (0..len).map(|_| lcg(&mut state)).collect();
+                let _ = parse_sni(&buf);
+
+                // A valid-looking record/handshake header over a random body —
+                // exercises the length-field paths with hostile lengths.
+                let mut framed = vec![0x16, 0x03, 0x01];
+                framed.extend_from_slice(&(len.min(0xffff) as u16).to_be_bytes());
+                framed.push(0x01);
+                framed.extend((0..len).map(|_| lcg(&mut state)));
+                let _ = parse_sni(&framed);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_overlong_sni() {
+        let bytes = craft_client_hello_with_sni(&"a".repeat(300));
+        assert_eq!(parse_sni(&bytes), None);
     }
 
     #[test]

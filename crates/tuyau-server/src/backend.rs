@@ -104,6 +104,7 @@ mod tests {
             acme: None,
             tls_cert_file: None,
             tls_key_file: None,
+            max_public_connections: None,
             upstreams: vec![],
         }
     }
