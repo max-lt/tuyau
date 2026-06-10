@@ -31,7 +31,7 @@ struct OneToken {
     host: String,
 }
 
-#[async_trait::async_trait]
+#[tuyau_server::async_trait]
 impl RoutingBackend for OneToken {
     async fn admit(&self, token: &[u8; 32]) -> Option<ClientGrant> {
         (token == &self.token).then(|| ClientGrant {
@@ -106,7 +106,7 @@ async fn dynamic_mode_allows_empty_clients() {
 /// claim the same hostname — exercises the one-client-per-host invariant.
 struct TwoTenants;
 
-#[async_trait::async_trait]
+#[tuyau_server::async_trait]
 impl RoutingBackend for TwoTenants {
     async fn admit(&self, token: &[u8; 32]) -> Option<ClientGrant> {
         let client_name = match token[0] {
@@ -125,7 +125,7 @@ impl RoutingBackend for TwoTenants {
 /// Backend whose admit never returns within ADMIT_TIMEOUT.
 struct HangingBackend;
 
-#[async_trait::async_trait]
+#[tuyau_server::async_trait]
 impl RoutingBackend for HangingBackend {
     async fn admit(&self, _token: &[u8; 32]) -> Option<ClientGrant> {
         tokio::time::sleep(Duration::from_secs(3600)).await;
