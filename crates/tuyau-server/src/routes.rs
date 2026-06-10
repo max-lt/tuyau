@@ -13,14 +13,15 @@ pub struct RouteEntry {
     pub conn: quinn::Connection,
 }
 
-/// All tunnels currently serving one hostname. With `last-write-wins` there is
-/// ever only one; with `round-robin` there may be several (active-active), and
-/// `cursor` spreads public connections across them.
+/// All tunnels currently serving one hostname. A hostname is owned by exactly
+/// one client (identity) at a time: with `last-write-wins` there is ever only
+/// one connection; with `round-robin` there may be several from the *same*
+/// client (active-active), and `cursor` spreads public connections across them.
+/// A grant from a different client takes the host over entirely (see `install`).
 #[derive(Debug)]
 struct HostRoutes {
     client_name: String,
     tls_mode: TlsMode,
-    balance: Balance,
     conns: Vec<quinn::Connection>,
     cursor: AtomicUsize,
 }
@@ -65,14 +66,27 @@ impl RoutingTable {
             let entry = guard.entry(host).or_insert_with(|| HostRoutes {
                 client_name: client_name.to_string(),
                 tls_mode,
-                balance,
                 conns: Vec::new(),
                 cursor: AtomicUsize::new(0),
             });
-            // Refresh metadata to the latest config view for this client.
-            entry.client_name = client_name.to_string();
+
+            // A grant from a *different* client takes the hostname over
+            // entirely: connections from two identities must never coexist under
+            // one host (round-robin would cross-route traffic between them, and
+            // last-write-wins would silently kick the rightful owner with no
+            // takeover semantics). Evict the incumbent's connections. In static
+            // mode config validation guarantees one client per host, so this
+            // only fires for a dynamic backend reassigning a host.
+            if entry.client_name != client_name {
+                tracing::warn!(
+                    previous_client = %entry.client_name,
+                    new_client = %client_name,
+                    "hostname reassigned to a different client; evicting previous owner's tunnels"
+                );
+                displaced.append(&mut entry.conns);
+                entry.client_name = client_name.to_string();
+            }
             entry.tls_mode = tls_mode;
-            entry.balance = balance;
 
             match balance {
                 Balance::LastWriteWins => {

@@ -35,6 +35,10 @@ const MAX_IDLE: Duration = Duration::from_secs(20);
 // the peer can close, before force-closing it. Bounds the resource a peer that
 // never closes can pin (it must not be held until MAX_IDLE).
 const REJECT_LINGER: Duration = Duration::from_secs(2);
+// Upper bound on a RoutingBackend admit decision. A dynamic backend may do I/O
+// (DB / control-plane lookup); without a bound a hung backend would stall the
+// handler forever (keep-alives stop the idle timeout from reaping it).
+const ADMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct TunnelServer {
     endpoint: Endpoint,
@@ -404,55 +408,73 @@ async fn handle_incoming(
     let hello_result = tokio::time::timeout(HELLO_TIMEOUT, reader.next()).await;
 
     let outcome = match hello_result {
-        Ok(Some(Ok(hello))) => match backend.admit(&hello.token).await {
-            Some(grant) => {
-                let host_list: Vec<&str> =
-                    grant.hostnames.iter().map(|(h, _)| h.as_str()).collect();
-
-                for prev in routes.install(
-                    grant.hostnames.clone(),
-                    &grant.client_name,
-                    grant.balance,
-                    &connection,
-                ) {
-                    tracing::info!(
-                        name = %grant.client_name,
-                        "kicking previous connection (last-write-wins)"
-                    );
-                    prev.close(0u32.into(), b"replaced by new connection");
-                }
-
-                tracing::info!(
-                    peer = %peer,
-                    name = %grant.client_name,
-                    client_name = %hello.client_name,
-                    hosts = ?host_list,
-                    "client connected"
-                );
-
-                match writer.send(HelloResponse::Welcome).await {
-                    Ok(()) => Outcome::Welcome,
-                    Err(e) => {
-                        tracing::warn!(peer = %peer, error = %e, "failed to send welcome");
-                        routes.remove_conn(connection.stable_id());
+        Ok(Some(Ok(hello))) => {
+            match tokio::time::timeout(ADMIT_TIMEOUT, backend.admit(&hello.token)).await {
+                Ok(Some(grant)) => {
+                    // The backend may have taken time (dynamic backends do I/O). If
+                    // the peer went away while we waited, drop instead of installing
+                    // a dead tunnel — and so a late grant can't displace a newer
+                    // connection that already took the host (the install drain is
+                    // order-blind).
+                    if connection.close_reason().is_some() {
+                        tracing::debug!(peer = %peer, "connection closed during admit; dropping");
                         return Ok(());
                     }
+
+                    let host_list: Vec<&str> =
+                        grant.hostnames.iter().map(|(h, _)| h.as_str()).collect();
+
+                    for prev in routes.install(
+                        grant.hostnames.clone(),
+                        &grant.client_name,
+                        grant.balance,
+                        &connection,
+                    ) {
+                        tracing::info!(name = %grant.client_name, "kicking previous connection");
+                        prev.close(0u32.into(), b"replaced by new connection");
+                    }
+
+                    tracing::info!(
+                        peer = %peer,
+                        name = %grant.client_name,
+                        client_name = %hello.client_name,
+                        hosts = ?host_list,
+                        "client connected"
+                    );
+
+                    match writer.send(HelloResponse::Welcome).await {
+                        Ok(()) => Outcome::Welcome,
+                        Err(e) => {
+                            tracing::warn!(peer = %peer, error = %e, "failed to send welcome");
+                            routes.remove_conn(connection.stable_id());
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        client_name = %hello.client_name,
+                        "client rejected: invalid token"
+                    );
+                    let _ = writer
+                        .send(HelloResponse::Reject {
+                            reason: "invalid token".into(),
+                        })
+                        .await;
+                    Outcome::Reject
+                }
+                Err(_) => {
+                    tracing::warn!(peer = %peer, "backend admit timed out; rejecting");
+                    let _ = writer
+                        .send(HelloResponse::Reject {
+                            reason: "authorization timeout".into(),
+                        })
+                        .await;
+                    Outcome::Reject
                 }
             }
-            None => {
-                tracing::warn!(
-                    peer = %peer,
-                    client_name = %hello.client_name,
-                    "client rejected: invalid token"
-                );
-                let _ = writer
-                    .send(HelloResponse::Reject {
-                        reason: "invalid token".into(),
-                    })
-                    .await;
-                Outcome::Reject
-            }
-        },
+        }
         Ok(Some(Err(e))) => {
             tracing::warn!(peer = %peer, error = %e, "hello decode failed");
             let _ = writer
