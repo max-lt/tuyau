@@ -99,7 +99,7 @@ impl TunnelServer {
         let fingerprint = material.fingerprint;
 
         let cancel = CancellationToken::new();
-        let routes = RoutingTable::new();
+        let routes = RoutingTable::with_upstreams(&config.upstreams);
 
         // Optional public listener — only spawned if configured. The cert
         // resolver is either a static self-signed multi-SAN cert (dev mode)

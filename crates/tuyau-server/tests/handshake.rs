@@ -26,6 +26,7 @@ async fn spin_up_server() -> (TunnelServer, TempDir) {
         acme: None,
         tls_cert_file: None,
         tls_key_file: None,
+        upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: VALID_TOKEN,
@@ -271,6 +272,7 @@ async fn fingerprint_stable_across_restarts() {
         acme: None,
         tls_cert_file: None,
         tls_key_file: None,
+        upstreams: vec![],
         clients: vec![ClientEntry {
             name: "a".into(),
             token: VALID_TOKEN,

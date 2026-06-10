@@ -44,6 +44,19 @@ host = "beta.example.com"
 client = "service-a"
 tls_mode = "passthrough"
 
+# Static local upstreams: serve a hostname by forwarding to a local address
+# instead of a client tunnel. Lets tuyau sit on :443 and front existing local
+# services (e.g. another daemon that holds its own cert). `passthrough` forwards
+# the raw TLS — tuyau never sees plaintext, the upstream terminates its own TLS;
+# `terminated` has tuyau terminate TLS (it needs a cert for the host) and forward
+# plaintext. Upstreams win over tunnel routes for the same host, so a client
+# can't hijack one. A server may run with only upstreams and no clients.
+#
+# [[upstreams]]
+# host = "db.example.com"
+# local_addr = "127.0.0.1:8443"
+# tls_mode = "passthrough"
+
 # Optional ACME / Let's Encrypt block. When uncommented, the public listener
 # fetches real browser-trusted certs via TLS-ALPN-01 instead of using a dev
 # self-signed cert. Applies to `terminated` hostnames only — passthrough

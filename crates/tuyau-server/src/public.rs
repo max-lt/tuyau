@@ -34,11 +34,12 @@ use tokio_util::sync::CancellationToken;
 use tuyau_protocol::{DataStreamHeader, FrameCodec, TlsMode};
 
 use crate::error::ServerError;
-use crate::routes::RoutingTable;
+use crate::routes::{Route, RouteEntry, RoutingTable};
 use crate::sni::parse_sni;
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECORD_SIZE: usize = 16 * 1024;
 
 pub(crate) struct PublicListenerHandle {
@@ -148,7 +149,7 @@ async fn handle_public(
         return Ok(());
     };
 
-    // 3. Route lookup.
+    // 3. Route lookup — either a client tunnel or a static local upstream.
     let route = match routes.lookup(&sni) {
         Some(r) => r,
         None => {
@@ -156,12 +157,17 @@ async fn handle_public(
             return Ok(());
         }
     };
+    let tls_mode = route.tls_mode();
+    let target = match &route {
+        Route::Tunnel(e) => format!("tunnel:{}", e.client_name),
+        Route::Local { addr, .. } => format!("local:{addr}"),
+    };
 
     tracing::info!(
         peer = %peer,
         sni = %sni,
-        mode = ?route.tls_mode,
-        client_name = %route.client_name,
+        mode = ?tls_mode,
+        target = %target,
         "public connection routed"
     );
 
@@ -170,9 +176,9 @@ async fn handle_public(
     let prefixed = PrefixedStream::new(client_hello, stream);
 
     // 5. Branch on TLS mode. For terminated, do the TLS handshake BEFORE
-    //    opening the tunnel stream — if the handshake turns out to be an
-    //    ACME `acme-tls/1` challenge, no QUIC dispatch should happen.
-    match route.tls_mode {
+    //    dispatching downstream — if the handshake turns out to be an ACME
+    //    `acme-tls/1` challenge, nothing downstream should happen.
+    match tls_mode {
         TlsMode::Terminated => {
             let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), prefixed);
             let start_handshake = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, acceptor).await {
@@ -196,40 +202,87 @@ async fn handle_public(
 
             // ACME TLS-ALPN-01 challenge: rustls-acme's resolver answered
             // the handshake with a special cert, the validator closes.
-            // No tunnel dispatch needed — bail.
+            // No downstream dispatch needed — bail.
             if tls_stream.get_ref().1.alpn_protocol() == Some(rustls_acme::acme::ACME_TLS_ALPN_NAME)
             {
                 tracing::info!(peer = %peer, sni = %sni, "acme-tls/1 challenge served");
                 return Ok(());
             }
 
-            // Real client request → dispatch over the tunnel now.
-            let (send, recv) = match open_tunnel_stream(&route, &sni, peer).await {
-                Some(p) => p,
-                None => return Ok(()),
-            };
-            pipe_bytes(tls_stream, send, recv).await;
+            // Real client request → forward plaintext downstream now.
+            match route {
+                Route::Tunnel(entry) => {
+                    let (send, recv) = match open_tunnel_stream(&entry, &sni, peer).await {
+                        Some(p) => p,
+                        None => return Ok(()),
+                    };
+                    pipe_bytes(tls_stream, send, recv).await;
+                }
+                Route::Local { addr, .. } => {
+                    if let Some(upstream) = connect_local(addr, &sni, peer).await {
+                        splice_local(tls_stream, upstream).await;
+                    }
+                }
+            }
         }
         TlsMode::Passthrough => {
             // Forward raw TCP bytes (ClientHello included via PrefixedStream)
-            // straight to the tunnel — no termination, no plaintext on this
-            // box. This is the structural privacy guarantee.
-            let (send, recv) = match open_tunnel_stream(&route, &sni, peer).await {
-                Some(p) => p,
-                None => return Ok(()),
-            };
-            pipe_bytes(prefixed, send, recv).await;
+            // downstream — no termination, no plaintext on this box. This is
+            // the structural privacy guarantee, preserved for both a client
+            // tunnel and a local upstream (which terminates its own TLS).
+            match route {
+                Route::Tunnel(entry) => {
+                    let (send, recv) = match open_tunnel_stream(&entry, &sni, peer).await {
+                        Some(p) => p,
+                        None => return Ok(()),
+                    };
+                    pipe_bytes(prefixed, send, recv).await;
+                }
+                Route::Local { addr, .. } => {
+                    if let Some(upstream) = connect_local(addr, &sni, peer).await {
+                        splice_local(prefixed, upstream).await;
+                    }
+                }
+            }
         }
     }
 
     Ok(())
 }
 
+/// Dial a static local upstream, with a timeout. `None` on failure (logged).
+async fn connect_local(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<TcpStream> {
+    match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => Some(s),
+        Ok(Err(e)) => {
+            tracing::warn!(peer = %peer, sni = %sni, %addr, error = %e, "local upstream connect failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer, sni = %sni, %addr, "local upstream connect timeout");
+            None
+        }
+    }
+}
+
+/// Splice a public-side stream to a local upstream, copying both directions
+/// until either end closes. Both sides are plain byte streams (no QUIC framing),
+/// so a single `copy_bidirectional` does it.
+async fn splice_local<A, B>(mut public_stream: A, mut upstream: B)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(e) = tokio::io::copy_bidirectional(&mut public_stream, &mut upstream).await {
+        tracing::debug!(error = %e, "local upstream splice ended with error");
+    }
+}
+
 /// Open a bidi QUIC stream on the matched tunnel and send the
 /// `DataStreamHeader` as the first frame. Returns `None` on any failure
 /// (logged); caller drops the connection.
 async fn open_tunnel_stream(
-    route: &crate::routes::RouteEntry,
+    route: &RouteEntry,
     sni: &str,
     peer: SocketAddr,
 ) -> Option<(quinn::SendStream, quinn::RecvStream)> {

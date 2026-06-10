@@ -33,6 +33,11 @@ pub struct ServerConfig {
     /// Private key (PEM) matching `tls_cert_file`.
     #[serde(default)]
     pub tls_key_file: Option<PathBuf>,
+    /// Static local upstreams: hostnames served by forwarding to a local
+    /// address rather than a client tunnel (see [`UpstreamEntry`]). Empty by
+    /// default; valid in both static and dynamic mode.
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamEntry>,
 }
 
 /// ACME / Let's Encrypt parameters. The default `directory_url` points at LE
@@ -86,13 +91,30 @@ pub struct HostnameEntry {
     pub tls_mode: TlsMode,
 }
 
+/// A static local upstream: a hostname served by forwarding to a local address
+/// instead of a client tunnel. Lets the server front existing local services —
+/// e.g. route `db.example.com` to `127.0.0.1:8443`. `passthrough` forwards the
+/// raw TLS bytes (the upstream terminates its own TLS, so this box never sees
+/// plaintext); `terminated` has the server terminate TLS (it must hold a cert
+/// for the host) and forward plaintext. Local upstreams win over tunnel routes
+/// for the same host, so a dynamic client can't hijack one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpstreamEntry {
+    pub host: String,
+    pub local_addr: SocketAddr,
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+}
+
 impl ServerConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.clients.is_empty() {
+        // A server must route *something* — at least one tunnel client or one
+        // static local upstream (a front-only deployment has no clients).
+        if self.clients.is_empty() && self.upstreams.is_empty() {
             return Err(ConfigError::NoClients);
         }
 
@@ -110,6 +132,13 @@ impl ServerConfig {
         for h in &self.hostnames {
             if !seen_hosts.insert(h.host.as_str()) {
                 return Err(ConfigError::DuplicateHost(h.host.clone()));
+            }
+        }
+        // Local upstreams share the hostname namespace: a host can't be both a
+        // tunnel route and a local upstream (nor two upstreams).
+        for u in &self.upstreams {
+            if !seen_hosts.insert(u.host.as_str()) {
+                return Err(ConfigError::DuplicateHost(u.host.clone()));
             }
         }
 
@@ -131,6 +160,14 @@ impl ServerConfig {
     /// is checked. In particular, an empty `clients` list is allowed.
     #[cfg(feature = "dynamic")]
     pub fn validate_dynamic(&self) -> Result<(), ConfigError> {
+        // Hostnames are backend-owned in dynamic mode, but upstreams are still
+        // static config — keep them unique among themselves.
+        let mut seen: HashSet<&str> = HashSet::new();
+        for u in &self.upstreams {
+            if !seen.insert(u.host.as_str()) {
+                return Err(ConfigError::DuplicateHost(u.host.clone()));
+            }
+        }
         self.validate_acme()
     }
 

@@ -21,7 +21,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use tuyau_client::{ClientConfig, TunnelClient};
-use tuyau_server::{Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, TunnelServer};
+use tuyau_server::{
+    Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, TunnelServer, UpstreamEntry,
+};
 
 const TOKEN: [u8; 32] = [0x42; 32];
 
@@ -34,6 +36,7 @@ async fn spin_up_with_public(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         acme: None,
         tls_cert_file: None,
         tls_key_file: None,
+        upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: TOKEN,
@@ -318,6 +321,52 @@ async fn public_tls_passthrough_forwards_raw_tls() {
     assert_eq!(http_body(&resp), body.as_slice());
 
     serve_handle.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_upstream_passthrough_forwards_to_local_service() {
+    // Same opaque-passthrough property as the test above, but with NO tunnel:
+    // the server has a STATIC local upstream for the hostname and forwards the
+    // raw TLS straight to a local TLS server it has no cert for. A 200 signed by
+    // the local cert proves the bytes flowed through. This is the "front an
+    // existing local service on :443" path.
+    let body = Arc::new(b"from-local-upstream".to_vec());
+    let local_addr = spawn_local_tls_http("front.example.com".to_string(), Arc::clone(&body)).await;
+
+    let dir = TempDir::new().unwrap();
+    let cfg = ServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+        tunnel_cert_dir: Some(dir.path().to_path_buf()),
+        acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
+        clients: vec![], // front-only: no tunnel clients
+        hostnames: vec![],
+        upstreams: vec![UpstreamEntry {
+            host: "front.example.com".into(),
+            local_addr,
+            tls_mode: TlsMode::Passthrough,
+        }],
+    };
+    let server = TunnelServer::start(cfg).await.unwrap();
+
+    let public_addr = server.public_local_addr().unwrap();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        http_get(public_addr, "front.example.com"),
+    )
+    .await
+    .expect("local-upstream response within 5s");
+
+    assert!(
+        resp.starts_with(b"HTTP/1.1 200 OK"),
+        "non-200 on local upstream: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(http_body(&resp), body.as_slice());
+
     server.shutdown().await;
 }
 
@@ -651,6 +700,7 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
         acme: None,
         tls_cert_file: None,
         tls_key_file: None,
+        upstreams: vec![],
         clients: vec![
             ClientEntry {
                 name: "alpha-srv".into(),
@@ -745,6 +795,7 @@ async fn round_robin_spreads_public_connections_across_tunnels() {
         acme: None,
         tls_cert_file: None,
         tls_key_file: None,
+        upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
             token: TOKEN,

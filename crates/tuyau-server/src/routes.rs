@@ -1,16 +1,41 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::config::{Balance, TlsMode};
+use crate::config::{Balance, TlsMode, UpstreamEntry};
 
-/// A single resolved route: the tunnel connection chosen to serve one public
+/// A single resolved tunnel route: the connection chosen to serve one public
 /// connection, plus the metadata the public listener needs.
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
     pub client_name: String,
     pub tls_mode: TlsMode,
     pub conn: quinn::Connection,
+}
+
+/// Where a hostname's public traffic goes: a client tunnel, or a static local
+/// upstream the server forwards to directly.
+#[derive(Debug, Clone)]
+pub enum Route {
+    Tunnel(RouteEntry),
+    Local { addr: SocketAddr, tls_mode: TlsMode },
+}
+
+impl Route {
+    pub fn tls_mode(&self) -> TlsMode {
+        match self {
+            Route::Tunnel(e) => e.tls_mode,
+            Route::Local { tls_mode, .. } => *tls_mode,
+        }
+    }
+}
+
+/// A static local upstream resolved for a hostname (from [`UpstreamEntry`]).
+#[derive(Debug, Clone, Copy)]
+struct LocalUpstream {
+    addr: SocketAddr,
+    tls_mode: TlsMode,
 }
 
 /// All tunnels currently serving one hostname. A hostname is owned by exactly
@@ -29,11 +54,30 @@ struct HostRoutes {
 #[derive(Debug, Clone, Default)]
 pub struct RoutingTable {
     inner: Arc<RwLock<HashMap<String, HostRoutes>>>,
+    /// Static local upstreams, fixed at construction (never change at runtime,
+    /// unlike tunnel routes). Take precedence over tunnels in `lookup`.
+    local: Arc<HashMap<String, LocalUpstream>>,
 }
 
 impl RoutingTable {
-    pub fn new() -> Self {
-        Self::default()
+    /// Build a table with static local upstreams installed.
+    pub fn with_upstreams(upstreams: &[UpstreamEntry]) -> Self {
+        let local = upstreams
+            .iter()
+            .map(|u| {
+                (
+                    u.host.clone(),
+                    LocalUpstream {
+                        addr: u.local_addr,
+                        tls_mode: u.tls_mode,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            local: Arc::new(local),
+        }
     }
 
     /// Install routes for a freshly authenticated connection, applying the
@@ -142,37 +186,48 @@ impl RoutingTable {
         conns
     }
 
-    /// Sorted snapshot of currently active hostnames (those with ≥1 tunnel).
+    /// Sorted snapshot of active hostnames: those with ≥1 tunnel, plus every
+    /// static local upstream.
     pub fn active_hostnames(&self) -> Vec<String> {
         let guard = self.inner.read().expect("routes lock poisoned");
-        let mut hosts: Vec<String> = guard.keys().cloned().collect();
+        let mut hosts: Vec<String> = guard
+            .keys()
+            .cloned()
+            .chain(self.local.keys().cloned())
+            .collect();
         hosts.sort();
+        hosts.dedup();
         hosts
     }
 
-    /// Resolve `host` to one tunnel connection. With multiple connections
-    /// (round-robin) successive lookups cycle through them; with one it always
-    /// returns that one. Used by the public listener per incoming connection.
-    pub fn lookup(&self, host: &str) -> Option<RouteEntry> {
+    /// Resolve `host` to a route. A static local upstream wins over any tunnel
+    /// for the same host (so a dynamic client can't hijack a fronted hostname).
+    /// Otherwise round-robins across the host's tunnels: successive lookups
+    /// cycle through them, skipping any already known closed; if every one is
+    /// dead, returns `None`.
+    pub fn lookup(&self, host: &str) -> Option<Route> {
+        if let Some(up) = self.local.get(host) {
+            return Some(Route::Local {
+                addr: up.addr,
+                tls_mode: up.tls_mode,
+            });
+        }
+
         let guard = self.inner.read().expect("routes lock poisoned");
         let entry = guard.get(host)?;
         let n = entry.conns.len();
         if n == 0 {
             return None;
         }
-        // Round-robin, but skip connections already known closed (their owning
-        // handler removes them shortly; this just avoids dispatching to a corpse
-        // in the meantime). Try at most one full cycle; if every connection is
-        // dead, drop rather than return one.
         for _ in 0..n {
             let idx = entry.cursor.fetch_add(1, Ordering::Relaxed) % n;
             let conn = &entry.conns[idx];
             if conn.close_reason().is_none() {
-                return Some(RouteEntry {
+                return Some(Route::Tunnel(RouteEntry {
                     client_name: entry.client_name.clone(),
                     tls_mode: entry.tls_mode,
                     conn: conn.clone(),
-                });
+                }));
             }
         }
         None
