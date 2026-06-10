@@ -311,7 +311,10 @@ fn build_cert_resolver(
                 multi: multi.clone(),
                 cfg: acme_cfg.clone(),
                 cancel,
-                static_domains: terminated_hostnames.iter().cloned().collect(),
+                static_domains: terminated_hostnames
+                    .iter()
+                    .map(|h| h.to_ascii_lowercase())
+                    .collect(),
                 added: Mutex::new(HashSet::new()),
             };
             return Ok((multi, Some(controller)));
@@ -400,7 +403,7 @@ impl ResolvesServerCert for MultiResolver {
                 .dynamic
                 .read()
                 .expect("acme map poisoned")
-                .get(sni)
+                .get(&sni.to_ascii_lowercase())
                 .cloned();
             if let Some(r) = per_domain {
                 return r.resolve(ch);
@@ -428,13 +431,14 @@ impl AcmeController {
     #[cfg(feature = "dynamic")]
     fn ensure(&self, domains: &[String]) {
         let mut added = self.added.lock().expect("acme added poisoned");
-        for d in domains {
-            if self.static_domains.contains(d) || !added.insert(d.clone()) {
+        for raw in domains {
+            let d = raw.to_ascii_lowercase();
+            if self.static_domains.contains(&d) || !added.insert(d.clone()) {
                 continue;
             }
             match build_acme_state(
                 &self.cfg,
-                std::slice::from_ref(d),
+                std::slice::from_ref(&d),
                 self.cancel.child_token(),
             ) {
                 Ok(resolver) => {
@@ -446,7 +450,7 @@ impl AcmeController {
                     tracing::info!(domain = %d, "acme: issuing cert for provisioned terminated hostname");
                 }
                 Err(e) => {
-                    added.remove(d);
+                    added.remove(&d);
                     tracing::error!(error = %e, domain = %d, "acme: failed to start issuance");
                 }
             }

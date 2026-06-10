@@ -85,12 +85,12 @@ impl RoutingTable {
         let terminated = hostnames
             .iter()
             .filter(|h| h.tls_mode == TlsMode::Terminated)
-            .map(|h| h.host.clone())
+            .map(|h| h.host.to_ascii_lowercase())
             .chain(
                 upstreams
                     .iter()
                     .filter(|u| u.tls_mode == TlsMode::Terminated)
-                    .map(|u| u.host.clone()),
+                    .map(|u| u.host.to_ascii_lowercase()),
             )
             .collect();
         Self {
@@ -101,11 +101,12 @@ impl RoutingTable {
     }
 
     /// Whether the server terminates TLS for `host` (it's in the known set).
+    /// Case-insensitive — DNS hostnames are, and clients/LE lowercase the SNI.
     pub fn is_terminated(&self, host: &str) -> bool {
         self.terminated
             .read()
             .expect("terminated lock poisoned")
-            .contains(host)
+            .contains(&host.to_ascii_lowercase())
     }
 
     /// Replace the whole terminated set. The caller (the dynamic seam) passes the
@@ -113,7 +114,7 @@ impl RoutingTable {
     #[cfg(feature = "dynamic")]
     pub fn set_terminated(&self, full: Vec<String>) {
         let mut g = self.terminated.write().expect("terminated lock poisoned");
-        *g = full.into_iter().collect();
+        *g = full.into_iter().map(|s| s.to_ascii_lowercase()).collect();
     }
 
     /// Install routes for a freshly authenticated connection, applying the
