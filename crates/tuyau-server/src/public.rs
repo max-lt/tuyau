@@ -33,7 +33,7 @@ use tokio_rustls::LazyConfigAcceptor;
 use tokio_util::codec::FramedWrite;
 use tokio_util::sync::CancellationToken;
 
-use tuyau_protocol::{DataStreamHeader, FrameCodec, TlsMode};
+use tuyau_protocol::{DataStreamHeader, FrameCodec};
 
 use crate::error::ServerError;
 use crate::routes::{Route, RouteEntry, RoutingTable, UpstreamTarget};
@@ -171,103 +171,75 @@ async fn handle_public(
         return Ok(());
     };
 
-    // 3. Route lookup — either a client tunnel or a static local upstream.
-    let route = match routes.lookup(&sni) {
-        Some(r) => r,
-        None => {
-            tracing::warn!(peer = %peer, sni = %sni, "no route for SNI, dropping");
-            return Ok(());
-        }
-    };
-    let tls_mode = route.tls_mode();
-    let route_desc = match &route {
-        Route::Tunnel(e) => format!("tunnel:{}", e.client_name),
-        Route::Local {
-            target: UpstreamTarget::Tcp(a),
-            ..
-        } => format!("local:{a}"),
-        Route::Local {
-            target: UpstreamTarget::Unix(p),
-            ..
-        } => format!("local:{}", p.display()),
-    };
-
-    tracing::info!(
-        peer = %peer,
-        sni = %sni,
-        mode = ?tls_mode,
-        target = %route_desc,
-        "public connection routed"
-    );
-
-    // 4. Wrap stream so the ClientHello bytes we already read are replayed
-    //    on the first reads.
+    // 3. Wrap the stream so the ClientHello bytes we already read are replayed.
     let prefixed = PrefixedStream::new(client_hello, stream);
 
-    // 5. Branch on TLS mode. For terminated, do the TLS handshake BEFORE
-    //    dispatching downstream — if the handshake turns out to be an ACME
-    //    `acme-tls/1` challenge, nothing downstream should happen.
-    match tls_mode {
-        TlsMode::Terminated => {
-            let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), prefixed);
-            let start_handshake = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, acceptor).await {
-                Ok(Ok(sh)) => sh,
-                Ok(Err(e)) => {
-                    tracing::warn!(peer = %peer, sni = %sni, error = %e, "TLS accept failed");
-                    return Ok(());
-                }
-                Err(_) => {
-                    tracing::warn!(peer = %peer, sni = %sni, "TLS accept timeout");
-                    return Ok(());
-                }
-            };
-            let tls_stream = match start_handshake.into_stream(rustls_config).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(peer = %peer, sni = %sni, error = %e, "TLS handshake failed");
-                    return Ok(());
-                }
-            };
-
-            // ACME TLS-ALPN-01 challenge: rustls-acme's resolver answered
-            // the handshake with a special cert, the validator closes.
-            // No downstream dispatch needed — bail.
-            if tls_stream.get_ref().1.alpn_protocol() == Some(rustls_acme::acme::ACME_TLS_ALPN_NAME)
-            {
-                tracing::info!(peer = %peer, sni = %sni, "acme-tls/1 challenge served");
+    // 4. Decide from the KNOWN terminated set (config + the dynamic seam), NOT a
+    //    live route: a provisioned terminated hostname is terminated even when no
+    //    tunnel is routing it yet — so its ACME challenge / cert is served (the
+    //    cert is for the domain, independent of any agent). Only a *real* request
+    //    then continues to the live backend.
+    if routes.is_terminated(&sni) {
+        let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), prefixed);
+        let start_handshake = match tokio::time::timeout(TLS_ACCEPT_TIMEOUT, acceptor).await {
+            Ok(Ok(sh)) => sh,
+            Ok(Err(e)) => {
+                tracing::warn!(peer = %peer, sni = %sni, error = %e, "TLS accept failed");
                 return Ok(());
             }
+            Err(_) => {
+                tracing::warn!(peer = %peer, sni = %sni, "TLS accept timeout");
+                return Ok(());
+            }
+        };
+        let tls_stream = match start_handshake.into_stream(rustls_config).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(peer = %peer, sni = %sni, error = %e, "TLS handshake failed");
+                return Ok(());
+            }
+        };
 
-            // Real client request → forward plaintext downstream now.
-            match route {
-                Route::Tunnel(entry) => {
-                    let (send, recv) = match open_tunnel_stream(&entry, &sni, peer).await {
-                        Some(p) => p,
-                        None => return Ok(()),
-                    };
+        // ACME TLS-ALPN-01 challenge: the resolver answered with the challenge
+        // cert, the validator closes. No backend dispatch — bail.
+        if tls_stream.get_ref().1.alpn_protocol() == Some(rustls_acme::acme::ACME_TLS_ALPN_NAME) {
+            tracing::info!(peer = %peer, sni = %sni, "acme-tls/1 challenge served");
+            return Ok(());
+        }
+
+        // Real request → forward plaintext to the live backend, or close if none.
+        match routes.lookup(&sni) {
+            Some(Route::Tunnel(entry)) => {
+                tracing::info!(peer = %peer, sni = %sni, target = %format!("tunnel:{}", entry.client_name), "public connection routed (terminated)");
+                if let Some((send, recv)) = open_tunnel_stream(&entry, &sni, peer).await {
                     pipe_bytes(tls_stream, send, recv).await;
                 }
-                Route::Local { target, .. } => {
-                    dispatch_local(tls_stream, &target, &sni, peer).await;
-                }
+            }
+            Some(Route::Local { target, .. }) => {
+                tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, local)");
+                dispatch_local(tls_stream, &target, &sni, peer).await;
+            }
+            None => {
+                tracing::info!(peer = %peer, sni = %sni, "terminated cert served but no live route (agent offline?)");
             }
         }
-        TlsMode::Passthrough => {
-            // Forward raw TCP bytes (ClientHello included via PrefixedStream)
-            // downstream — no termination, no plaintext on this box. This is
-            // the structural privacy guarantee, preserved for both a client
-            // tunnel and a local upstream (which terminates its own TLS).
-            match route {
-                Route::Tunnel(entry) => {
-                    let (send, recv) = match open_tunnel_stream(&entry, &sni, peer).await {
-                        Some(p) => p,
-                        None => return Ok(()),
-                    };
+    } else {
+        // Passthrough — forward raw bytes (ClientHello included). No termination,
+        // no plaintext on this box: the privacy guarantee. The downstream (tunnel
+        // or local upstream) terminates its own TLS.
+        match routes.lookup(&sni) {
+            Some(Route::Tunnel(entry)) => {
+                tracing::info!(peer = %peer, sni = %sni, target = %format!("tunnel:{}", entry.client_name), "public connection routed (passthrough)");
+                if let Some((send, recv)) = open_tunnel_stream(&entry, &sni, peer).await {
                     pipe_bytes(prefixed, send, recv).await;
                 }
-                Route::Local { target, .. } => {
-                    dispatch_local(prefixed, &target, &sni, peer).await;
-                }
+            }
+            Some(Route::Local { target, .. }) => {
+                tracing::info!(peer = %peer, sni = %sni, "public connection routed (passthrough, local)");
+                dispatch_local(prefixed, &target, &sni, peer).await;
+            }
+            None => {
+                tracing::warn!(peer = %peer, sni = %sni, "no route for SNI, dropping");
             }
         }
     }

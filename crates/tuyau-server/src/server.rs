@@ -99,7 +99,7 @@ impl TunnelServer {
         let fingerprint = material.fingerprint;
 
         let cancel = CancellationToken::new();
-        let routes = RoutingTable::with_upstreams(&config.upstreams);
+        let routes = RoutingTable::from_config(&config.hostnames, &config.upstreams);
 
         // Optional public listener — only spawned if configured. The cert
         // resolver is either a static self-signed multi-SAN cert (dev mode)
@@ -238,6 +238,20 @@ impl TunnelServer {
             c.close(0u32.into(), b"revoked");
         }
         n
+    }
+
+    /// Update the set of hostnames the server terminates TLS for — the config
+    /// set ∪ the backend's provisioned terminated hostnames. The public listener
+    /// decides "terminate this SNI?" from it, independently of any live tunnel,
+    /// so a provisioned terminated hostname's cert / ACME challenge is served
+    /// even before its agent connects. Behind the `dynamic` feature.
+    ///
+    /// (Issuing certs for the dynamic set is wired separately — see the ACME
+    /// controller — so a terminated hostname only serves a *valid* cert once its
+    /// ACME order completes.)
+    #[cfg(feature = "dynamic")]
+    pub fn set_terminated_domains(&self, domains: Vec<String>) {
+        self.routes.set_terminated(domains);
     }
 
     pub async fn shutdown(self) {

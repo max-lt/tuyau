@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::config::{Balance, TlsMode, UpstreamEntry};
+use crate::config::{Balance, HostnameEntry, TlsMode, UpstreamEntry};
 
 /// A single resolved tunnel route: the connection chosen to serve one public
 /// connection, plus the metadata the public listener needs.
@@ -23,30 +23,18 @@ pub enum UpstreamTarget {
 }
 
 /// Where a hostname's public traffic goes: a client tunnel, or a static local
-/// upstream the server forwards to directly.
+/// upstream the server forwards to directly. Whether to terminate TLS is decided
+/// separately, from the routing table's terminated set ([`RoutingTable::is_terminated`]).
 #[derive(Debug, Clone)]
 pub enum Route {
     Tunnel(RouteEntry),
-    Local {
-        target: UpstreamTarget,
-        tls_mode: TlsMode,
-    },
-}
-
-impl Route {
-    pub fn tls_mode(&self) -> TlsMode {
-        match self {
-            Route::Tunnel(e) => e.tls_mode,
-            Route::Local { tls_mode, .. } => *tls_mode,
-        }
-    }
+    Local { target: UpstreamTarget },
 }
 
 /// A static local upstream resolved for a hostname (from [`UpstreamEntry`]).
 #[derive(Debug, Clone)]
 struct LocalUpstream {
     target: UpstreamTarget,
-    tls_mode: TlsMode,
 }
 
 /// All tunnels currently serving one hostname. A hostname is owned by exactly
@@ -68,13 +56,19 @@ pub struct RoutingTable {
     /// Static local upstreams, fixed at construction (never change at runtime,
     /// unlike tunnel routes). Take precedence over tunnels in `lookup`.
     local: Arc<HashMap<String, LocalUpstream>>,
+    /// Hostnames the server terminates TLS for — the KNOWN set (config + the
+    /// dynamic seam). The public listener decides "terminate this SNI?" from
+    /// this (so an ACME challenge / the cert is served regardless of whether a
+    /// tunnel is currently routed), and the ACME domain list mirrors it.
+    terminated: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl RoutingTable {
-    /// Build a table with static local upstreams installed. Config validation
-    /// guarantees each entry names exactly one target; an entry with neither is
-    /// defensively skipped.
-    pub fn with_upstreams(upstreams: &[UpstreamEntry]) -> Self {
+    /// Build a table from config: static local upstreams + the terminated-set
+    /// seed. Config validation guarantees each upstream names exactly one target;
+    /// an entry with neither is defensively skipped. In dynamic mode `hostnames`
+    /// is empty (the backend owns them) and the seam seeds the terminated set.
+    pub fn from_config(hostnames: &[HostnameEntry], upstreams: &[UpstreamEntry]) -> Self {
         let local = upstreams
             .iter()
             .filter_map(|u| {
@@ -83,19 +77,43 @@ impl RoutingTable {
                     (None, Some(addr)) => UpstreamTarget::Tcp(addr),
                     (None, None) => return None,
                 };
-                Some((
-                    u.host.clone(),
-                    LocalUpstream {
-                        target,
-                        tls_mode: u.tls_mode,
-                    },
-                ))
+                Some((u.host.clone(), LocalUpstream { target }))
             })
+            .collect();
+        // Seed the terminated set with every terminated hostname known from
+        // config — tunnel-routed (`hostnames`) AND local upstreams.
+        let terminated = hostnames
+            .iter()
+            .filter(|h| h.tls_mode == TlsMode::Terminated)
+            .map(|h| h.host.clone())
+            .chain(
+                upstreams
+                    .iter()
+                    .filter(|u| u.tls_mode == TlsMode::Terminated)
+                    .map(|u| u.host.clone()),
+            )
             .collect();
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             local: Arc::new(local),
+            terminated: Arc::new(RwLock::new(terminated)),
         }
+    }
+
+    /// Whether the server terminates TLS for `host` (it's in the known set).
+    pub fn is_terminated(&self, host: &str) -> bool {
+        self.terminated
+            .read()
+            .expect("terminated lock poisoned")
+            .contains(host)
+    }
+
+    /// Replace the whole terminated set. The caller (the dynamic seam) passes the
+    /// full set it knows (config-terminated ∪ backend-provisioned terminated).
+    #[cfg(feature = "dynamic")]
+    pub fn set_terminated(&self, full: Vec<String>) {
+        let mut g = self.terminated.write().expect("terminated lock poisoned");
+        *g = full.into_iter().collect();
     }
 
     /// Install routes for a freshly authenticated connection, applying the
@@ -227,7 +245,6 @@ impl RoutingTable {
         if let Some(up) = self.local.get(host) {
             return Some(Route::Local {
                 target: up.target.clone(),
-                tls_mode: up.tls_mode,
             });
         }
 
