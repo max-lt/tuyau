@@ -22,7 +22,9 @@ use tempfile::TempDir;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use tuyau_protocol::{ALPN, FrameCodec, Hello, HelloResponse};
-use tuyau_server::{Balance, ClientGrant, RoutingBackend, ServerConfig, TlsMode, TunnelServer};
+use tuyau_server::{
+    Balance, ClientGrant, ControlEvent, RoutingBackend, ServerConfig, TlsMode, TunnelServer,
+};
 
 /// A minimal embedder-style backend: admits one token, granting one passthrough
 /// hostname. Stands in for a managed control plane querying its own store.
@@ -265,6 +267,65 @@ async fn admit_timeout_rejects_instead_of_hanging() {
         }
         other => panic!("expected Reject, got {other:?}"),
     }
+
+    endpoint.close(0u32.into(), b"done");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn observe_reports_tunnel_up_and_down() {
+    let dir = TempDir::new().unwrap();
+    let server = TunnelServer::start_with(
+        Arc::new(OneToken {
+            token: [7u8; 32],
+            host: "x.example".into(),
+        }),
+        dyn_cfg(&dir),
+    )
+    .await
+    .unwrap();
+    let mut events = server.subscribe();
+    let addr = server.local_addr().unwrap();
+    let endpoint = client_endpoint();
+
+    let (conn, resp) = connect_and_hello(addr, &endpoint, [7u8; 32]).await;
+    assert!(matches!(resp, HelloResponse::Welcome));
+
+    // TunnelUp event + snapshot.
+    let up = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("event within 5s")
+        .expect("event channel open");
+    match up {
+        ControlEvent::TunnelUp {
+            client_name,
+            hostnames,
+            ..
+        } => {
+            assert_eq!(client_name, "dyn");
+            assert_eq!(hostnames, vec!["x.example".to_string()]);
+        }
+        other => panic!("expected TunnelUp, got {other:?}"),
+    }
+    let snap = server.tunnels();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].client_name, "dyn");
+    assert_eq!(snap[0].hostnames, vec!["x.example".to_string()]);
+
+    // Dropping the tunnel emits TunnelDown and clears the registry.
+    drop(conn);
+    let down = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("event within 5s")
+        .expect("event channel open");
+    assert!(
+        matches!(down, ControlEvent::TunnelDown { ref client_name, .. } if client_name == "dyn"),
+        "expected TunnelDown for dyn, got {down:?}"
+    );
+    assert!(
+        server.tunnels().is_empty(),
+        "tunnel removed from the registry on down"
+    );
 
     endpoint.close(0u32.into(), b"done");
     server.shutdown().await;

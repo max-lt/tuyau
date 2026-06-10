@@ -3,6 +3,7 @@
 mod backend;
 mod cert;
 mod config;
+mod control;
 mod error;
 mod public;
 mod routes;
@@ -30,3 +31,9 @@ pub use server::TunnelServer;
 pub use async_trait::async_trait;
 #[cfg(feature = "dynamic")]
 pub use backend::{ClientGrant, RoutingBackend};
+
+/// Live, metadata-only observability of connected tunnels, surfaced by
+/// [`TunnelServer::tunnels`] (snapshot) and [`TunnelServer::subscribe`] (event
+/// stream). Behind the `dynamic` feature.
+#[cfg(feature = "dynamic")]
+pub use control::{ControlEvent, TunnelInfo};

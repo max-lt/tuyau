@@ -18,6 +18,7 @@ use rustls::sign::CertifiedKey;
 use crate::backend::{RoutingBackend, StaticBackend};
 use crate::cert::{self, CertMaterial};
 use crate::config::{AcmeSection, ServerConfig, TlsMode};
+use crate::control::{Control, TunnelInfo};
 use crate::error::ServerError;
 use crate::public;
 use crate::routes::RoutingTable;
@@ -44,6 +45,10 @@ pub struct TunnelServer {
     endpoint: Endpoint,
     fingerprint: [u8; 32],
     routes: RoutingTable,
+    // Read only via the `dynamic`-gated tunnels()/subscribe(); still populated
+    // (no-op) without the feature so the accept loop can notify it.
+    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
+    control: Control,
     public_addr: Option<SocketAddr>,
     cancel: CancellationToken,
     accept_handle: JoinHandle<()>,
@@ -142,18 +147,28 @@ impl TunnelServer {
             None => (None, None, None),
         };
 
+        let control = Control::new();
         let endpoint_clone = endpoint.clone();
         let routes_clone = routes.clone();
+        let control_clone = control.clone();
         let cancel_clone = cancel.clone();
 
         let accept_handle = tokio::spawn(async move {
-            accept_loop(endpoint_clone, backend, routes_clone, cancel_clone).await;
+            accept_loop(
+                endpoint_clone,
+                backend,
+                routes_clone,
+                control_clone,
+                cancel_clone,
+            )
+            .await;
         });
 
         Ok(Self {
             endpoint,
             fingerprint,
             routes,
+            control,
             public_addr,
             cancel,
             accept_handle,
@@ -180,6 +195,20 @@ impl TunnelServer {
     /// while its owning client tunnel is connected).
     pub fn active_hostnames(&self) -> Vec<String> {
         self.routes.active_hostnames()
+    }
+
+    /// Snapshot of currently connected tunnels (metadata only). Behind the
+    /// `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn tunnels(&self) -> Vec<TunnelInfo> {
+        self.control.tunnels()
+    }
+
+    /// Subscribe to the live tunnel-event stream (metadata only). Behind the
+    /// `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::control::ControlEvent> {
+        self.control.subscribe()
     }
 
     pub async fn shutdown(self) {
@@ -343,6 +372,7 @@ async fn accept_loop(
     endpoint: Endpoint,
     backend: Arc<dyn RoutingBackend>,
     routes: RoutingTable,
+    control: Control,
     cancel: CancellationToken,
 ) {
     loop {
@@ -358,9 +388,11 @@ async fn accept_loop(
                 };
                 let backend = Arc::clone(&backend);
                 let routes = routes.clone();
+                let control = control.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_incoming(incoming, backend, routes, cancel).await {
+                    if let Err(e) = handle_incoming(incoming, backend, routes, control, cancel).await
+                    {
                         tracing::warn!(error = %e, "connection handler error");
                     }
                 });
@@ -381,6 +413,7 @@ async fn handle_incoming(
     incoming: quinn::Incoming,
     backend: Arc<dyn RoutingBackend>,
     routes: RoutingTable,
+    control: Control,
     cancel: CancellationToken,
 ) -> Result<(), ServerError> {
     let connection = incoming.await?;
@@ -443,7 +476,21 @@ async fn handle_incoming(
                     );
 
                     match writer.send(HelloResponse::Welcome).await {
-                        Ok(()) => Outcome::Welcome,
+                        Ok(()) => {
+                            control.register(
+                                connection.stable_id(),
+                                TunnelInfo {
+                                    client_name: grant.client_name.clone(),
+                                    peer,
+                                    hostnames: grant
+                                        .hostnames
+                                        .iter()
+                                        .map(|(h, _)| h.clone())
+                                        .collect(),
+                                },
+                            );
+                            Outcome::Welcome
+                        }
                         Err(e) => {
                             tracing::warn!(peer = %peer, error = %e, "failed to send welcome");
                             routes.remove_conn(connection.stable_id());
@@ -533,5 +580,6 @@ async fn handle_incoming(
     }
 
     routes.remove_conn(stable_id);
+    control.unregister(stable_id);
     Ok(())
 }
