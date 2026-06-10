@@ -43,6 +43,12 @@ const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECORD_SIZE: usize = 16 * 1024;
+/// Pause after a failed `accept()` before retrying. A persistent error — notably
+/// file-descriptor exhaustion (EMFILE/ENFILE), where `accept()` returns
+/// immediately — would otherwise spin the loop at 100% CPU and starve every
+/// other connection (including anything else this server fronts). A healthy
+/// listener never takes this path, so the delay costs nothing in normal operation.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Default cap on concurrent public connections being handled (overridable via
 /// `ServerConfig::max_public_connections`). Bounds memory / FDs under a flood.
@@ -195,7 +201,10 @@ async fn accept_loop(
                 let (stream, peer) = match accept {
                     Ok(x) => x,
                     Err(e) => {
-                        tracing::warn!(error = %e, "public accept failed");
+                        // Back off so a persistent error (e.g. FD exhaustion)
+                        // can't spin the loop at 100% CPU and starve everything.
+                        tracing::warn!(error = %e, "public accept failed; backing off");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         continue;
                     }
                 };

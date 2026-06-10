@@ -232,6 +232,21 @@ impl TunnelServer {
         self.routes.active_hostnames()
     }
 
+    /// Liveness for a process watchdog: `false` if an accept loop has stopped
+    /// (panicked or exited), which would silently stop serving new connections
+    /// while the process stays up. A supervisor (e.g. systemd via sd_notify)
+    /// should withhold its watchdog ping on `false` and let the process restart.
+    /// Cheap and non-blocking (no locks) — safe to call on a tight timer.
+    pub fn healthy(&self) -> bool {
+        if self.accept_handle.is_finished() {
+            return false;
+        }
+        !self
+            .public_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
     /// Snapshot of currently connected tunnels (metadata only). Behind the
     /// `dynamic` feature.
     #[cfg(feature = "dynamic")]
