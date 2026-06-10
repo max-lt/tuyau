@@ -48,6 +48,65 @@ const MAX_RECORD_SIZE: usize = 16 * 1024;
 /// `ServerConfig::max_public_connections`). Bounds memory / FDs under a flood.
 pub(crate) const DEFAULT_MAX_PUBLIC_CONNECTIONS: usize = 1024;
 
+/// Per-IP cap on concurrent public connections, derived from the global cap. A
+/// single source IP can otherwise hold every global permit and starve everything
+/// the server fronts (a connection-exhaustion DoS). The floor keeps it usable
+/// when the global cap is tiny (tests), where the global limit binds first.
+fn max_conns_per_ip(global: usize) -> usize {
+    (global / 8).max(16)
+}
+
+/// Counts concurrent public connections per source IP and refuses new ones past
+/// the cap. A held [`IpPermit`] is one live connection; the count is decremented
+/// (and the entry dropped at zero, so the map stays bounded by live IPs) when it
+/// is dropped. parking_lot Mutex — non-poisoning, like the routing table.
+#[derive(Clone)]
+struct PerIpLimiter {
+    max_per_ip: usize,
+    counts: Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+}
+
+struct IpPermit {
+    ip: std::net::IpAddr,
+    counts: Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl PerIpLimiter {
+    fn new(max_per_ip: usize) -> Self {
+        Self {
+            max_per_ip,
+            counts: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Reserve a slot for `ip`, or `None` if it's already at the cap. A fresh IP
+    /// (count 0) is always below the cap (cap ≥ 1), so this never leaves a 0 entry.
+    fn try_acquire(&self, ip: std::net::IpAddr) -> Option<IpPermit> {
+        let mut counts = self.counts.lock();
+        let c = counts.entry(ip).or_insert(0);
+        if *c >= self.max_per_ip {
+            return None;
+        }
+        *c += 1;
+        Some(IpPermit {
+            ip,
+            counts: self.counts.clone(),
+        })
+    }
+}
+
+impl Drop for IpPermit {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(c) = counts.get_mut(&self.ip) {
+            *c -= 1;
+            if *c == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
 pub(crate) struct PublicListenerHandle {
     pub local_addr: SocketAddr,
     pub join: JoinHandle<()>,
@@ -123,6 +182,9 @@ async fn accept_loop(
     // for a connection's whole lifetime; when none are free, new connections are
     // shed rather than queued, so a flood can't grow tasks/memory without bound.
     let limiter = Arc::new(Semaphore::new(max_conns));
+    // Plus a per-IP cap so a single source can't hold every global permit and
+    // starve the rest (including anything else this server fronts).
+    let per_ip = PerIpLimiter::new(max_conns_per_ip(max_conns));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -146,11 +208,22 @@ async fn accept_loop(
                         continue;
                     }
                 };
+                // Per-IP cap: a single source can hold at most its share, so it
+                // can't monopolise the global pool. Shed (not queue) past it.
+                let ip_permit = match per_ip.try_acquire(peer.ip()) {
+                    Some(p) => p,
+                    None => {
+                        tracing::debug!(peer = %peer, "per-IP connection cap reached, shedding");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let rustls_config = rustls_config.clone();
                 let routes = routes.clone();
                 let error_502 = error_502.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // released when this connection ends
+                    let _ip_permit = ip_permit; // decrements the per-IP count on end
                     if let Err(e) = handle_public(stream, peer, rustls_config, routes, error_502).await {
                         tracing::warn!(peer = %peer, error = %e, "public connection error");
                     }
@@ -482,5 +555,39 @@ async fn pipe_bytes<S>(
     }
     if let Err(e) = down_res {
         tracing::debug!(error = %e, "tunnel→public copy ended with error");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn per_ip_limiter_caps_and_releases() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let lim = PerIpLimiter::new(2);
+
+        let a = lim.try_acquire(ip).expect("1st under cap");
+        let b = lim.try_acquire(ip).expect("2nd under cap");
+        assert!(lim.try_acquire(ip).is_none(), "3rd from same IP is capped");
+        // A different IP is unaffected by the first IP's count.
+        let c = lim.try_acquire(other).expect("other IP independent");
+
+        drop(b); // free one slot for `ip`
+        let d = lim.try_acquire(ip).expect("slot freed → acquire again");
+
+        drop(a);
+        drop(d);
+        drop(c);
+        // All released: the map drops emptied IPs, so it's back to empty.
+        assert!(lim.counts.lock().is_empty(), "map must not leak IP entries");
+    }
+
+    #[test]
+    fn per_ip_cap_derives_from_global_with_floor() {
+        assert_eq!(max_conns_per_ip(1024), 128);
+        assert_eq!(max_conns_per_ip(1), 16); // floor for tiny/global-bound caps
     }
 }

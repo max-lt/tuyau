@@ -1,8 +1,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+
+// parking_lot locks DON'T poison: if a thread panics while holding a guard, the
+// next acquirer still gets the lock (with whatever state was left — always a
+// valid map, never UB). A std lock would poison and every later `.expect()`
+// would panic, cascading one stray panic into "all routing dead" — which would
+// take down everything this server fronts. Never reintroduce a poisoning lock here.
+use parking_lot::RwLock;
 
 use crate::config::{Balance, HostnameEntry, TlsMode, UpstreamEntry};
 
@@ -103,17 +110,14 @@ impl RoutingTable {
     /// Whether the server terminates TLS for `host` (it's in the known set).
     /// Case-insensitive — DNS hostnames are, and clients/LE lowercase the SNI.
     pub fn is_terminated(&self, host: &str) -> bool {
-        self.terminated
-            .read()
-            .expect("terminated lock poisoned")
-            .contains(&host.to_ascii_lowercase())
+        self.terminated.read().contains(&host.to_ascii_lowercase())
     }
 
     /// Replace the whole terminated set. The caller (the dynamic seam) passes the
     /// full set it knows (config-terminated ∪ backend-provisioned terminated).
     #[cfg(feature = "dynamic")]
     pub fn set_terminated(&self, full: Vec<String>) {
-        let mut g = self.terminated.write().expect("terminated lock poisoned");
+        let mut g = self.terminated.write();
         *g = full.into_iter().map(|s| s.to_ascii_lowercase()).collect();
     }
 
@@ -139,7 +143,7 @@ impl RoutingTable {
             return Vec::new();
         }
 
-        let mut guard = self.inner.write().expect("routes lock poisoned");
+        let mut guard = self.inner.write();
         let new_id = conn.stable_id();
         let mut displaced: Vec<quinn::Connection> = Vec::new();
 
@@ -193,7 +197,7 @@ impl RoutingTable {
     /// any host left with no connections. Called when a tunnel closes
     /// (peer-initiated, timeout, or shutdown).
     pub fn remove_conn(&self, stable_id: usize) {
-        let mut guard = self.inner.write().expect("routes lock poisoned");
+        let mut guard = self.inner.write();
         guard.retain(|_, entry| {
             entry.conns.retain(|c| c.stable_id() != stable_id);
             !entry.conns.is_empty()
@@ -205,7 +209,7 @@ impl RoutingTable {
     /// hosts) so the caller can close them. Used for control-plane revocation.
     #[cfg(feature = "dynamic")]
     pub fn kick(&self, client_name: &str) -> Vec<quinn::Connection> {
-        let mut guard = self.inner.write().expect("routes lock poisoned");
+        let mut guard = self.inner.write();
         let mut conns: Vec<quinn::Connection> = Vec::new();
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         guard.retain(|_, entry| {
@@ -226,7 +230,7 @@ impl RoutingTable {
     /// Sorted snapshot of active hostnames: those with ≥1 tunnel, plus every
     /// static local upstream.
     pub fn active_hostnames(&self) -> Vec<String> {
-        let guard = self.inner.read().expect("routes lock poisoned");
+        let guard = self.inner.read();
         let mut hosts: Vec<String> = guard
             .keys()
             .cloned()
@@ -249,7 +253,7 @@ impl RoutingTable {
             });
         }
 
-        let guard = self.inner.read().expect("routes lock poisoned");
+        let guard = self.inner.read();
         let entry = guard.get(host)?;
         let n = entry.conns.len();
         if n == 0 {
@@ -267,5 +271,44 @@ impl RoutingTable {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SPOF guard: a panic while a routing-table guard is held must NOT
+    /// wedge the table. With a std (poisoning) lock the post-panic calls below
+    /// would themselves panic, cascading one stray panic into "all routing dead"
+    /// — and this server fronts other services. parking_lot doesn't poison, so
+    /// the table keeps working. If this test ever panics, a poisoning lock was
+    /// reintroduced.
+    #[test]
+    fn panic_while_holding_a_guard_does_not_wedge_the_table() {
+        let table = RoutingTable::default();
+
+        // Panic in another thread while holding the inner (routes) write guard.
+        let t = table.clone();
+        let res = std::thread::spawn(move || {
+            let _g = t.inner.write();
+            panic!("boom while holding the routes lock");
+        })
+        .join();
+        assert!(res.is_err(), "the spawned thread was expected to panic");
+
+        // Same for the terminated set.
+        let t = table.clone();
+        let res = std::thread::spawn(move || {
+            let _g = t.terminated.write();
+            panic!("boom while holding the terminated lock");
+        })
+        .join();
+        assert!(res.is_err());
+
+        // The table must still answer — not panic on a poisoned lock.
+        assert!(table.lookup("anything.example.com").is_none());
+        assert!(!table.is_terminated("anything.example.com"));
+        assert!(table.active_hostnames().is_empty());
     }
 }

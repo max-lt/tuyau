@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+
+// Non-poisoning locks on the resolver hot path — see the note in routes.rs. A
+// poisoned cert-resolver lock would fail every TLS handshake on the server.
+use parking_lot::{Mutex, RwLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -412,12 +416,7 @@ struct MultiResolver {
 impl ResolvesServerCert for MultiResolver {
     fn resolve(&self, ch: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         if let Some(sni) = ch.server_name() {
-            let per_domain = self
-                .dynamic
-                .read()
-                .expect("acme map poisoned")
-                .get(&sni.to_ascii_lowercase())
-                .cloned();
+            let per_domain = self.dynamic.read().get(&sni.to_ascii_lowercase()).cloned();
             if let Some(r) = per_domain {
                 return r.resolve(ch);
             }
@@ -443,7 +442,7 @@ impl AcmeController {
     /// already covered (by the static cert or a previous call). Idempotent.
     #[cfg(feature = "dynamic")]
     fn ensure(&self, domains: &[String]) {
-        let mut added = self.added.lock().expect("acme added poisoned");
+        let mut added = self.added.lock();
         for raw in domains {
             let d = raw.to_ascii_lowercase();
             if self.static_domains.contains(&d) || !added.insert(d.clone()) {
@@ -455,11 +454,7 @@ impl AcmeController {
                 self.cancel.child_token(),
             ) {
                 Ok(resolver) => {
-                    self.multi
-                        .dynamic
-                        .write()
-                        .expect("acme map poisoned")
-                        .insert(d.clone(), resolver);
+                    self.multi.dynamic.write().insert(d.clone(), resolver);
                     tracing::info!(domain = %d, "acme: issuing cert for provisioned terminated hostname");
                 }
                 Err(e) => {

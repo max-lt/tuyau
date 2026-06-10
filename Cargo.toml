@@ -55,6 +55,10 @@ anyhow = "1"
 subtle = "2"
 rand = "0.8"
 
+# Non-poisoning locks (hot-path routing table / resolver): a panic while a guard
+# is held must NOT poison the lock and cascade into "all routing dead".
+parking_lot = "0.12"
+
 # Test fixtures
 tempfile = "3"
 
