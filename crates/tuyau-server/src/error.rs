@@ -32,6 +32,9 @@ pub enum ConfigError {
     #[error("parse error: {0}")]
     Parse(String),
 
+    #[error("duplicate client name: {0}")]
+    DuplicateClient(String),
+
     #[error("duplicate hostname: {0}")]
     DuplicateHost(String),
 

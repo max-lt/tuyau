@@ -96,6 +96,16 @@ impl ServerConfig {
             return Err(ConfigError::NoClients);
         }
 
+        // Client names must be unique: hostnames are bound to a client by name,
+        // so two entries sharing a name would split one logical identity across
+        // tokens (and pick a balance per matched entry) — a silent foot-gun.
+        let mut seen_clients: HashSet<&str> = HashSet::new();
+        for c in &self.clients {
+            if !seen_clients.insert(c.name.as_str()) {
+                return Err(ConfigError::DuplicateClient(c.name.clone()));
+            }
+        }
+
         let mut seen_hosts: HashSet<&str> = HashSet::new();
         for h in &self.hostnames {
             if !seen_hosts.insert(h.host.as_str()) {
@@ -207,6 +217,24 @@ mod tests {
         "#;
         let cfg = ServerConfig::from_toml_str(toml).unwrap();
         assert!(matches!(cfg.validate(), Err(ConfigError::NoClients)));
+    }
+
+    #[test]
+    fn rejects_duplicate_client_names() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:4433"
+            [[clients]]
+            name = "a"
+            token = "0000000000000000000000000000000000000000000000000000000000000001"
+            [[clients]]
+            name = "a"
+            token = "0000000000000000000000000000000000000000000000000000000000000002"
+        "#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::DuplicateClient(name)) if name == "a"
+        ));
     }
 
     #[test]
