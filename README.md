@@ -20,8 +20,8 @@ a local service.
               (tunnel 4433/UDP)
 ```
 
-> **Status:** pre-alpha. Wire protocol may change between milestones. See
-> [`.claude/plan.md`](.claude/plan.md) for the build plan.
+> **Status:** alpha. Running in production, but the wire protocol may still
+> change between releases.
 
 ## Features
 
@@ -45,13 +45,20 @@ a local service.
 - **Pinned tunnel cert**: the client pins the server's tunnel cert by SHA-256
   fingerprint — no PKI, no LE for the tunnel itself.
 - **ACME / Let's Encrypt for public certs**: enable an optional `[acme]`
-  block in `server.toml` to fetch real browser-trusted certs via
-  TLS-ALPN-01. Without it, the public listener serves a dev self-signed
+  block in `server.toml` and the server fetches real browser-trusted certs
+  via TLS-ALPN-01 — per hostname, on demand, including hostnames added at
+  runtime. Without it, the public listener serves a dev self-signed
   multi-SAN cert (`curl -k` works; browsers complain).
 - **Bring your own cert**: when inbound TLS-ALPN-01 can't run (public 443 is
   held by another service, or inbound IPv6 is unreliable for the CA's
   validation), set `tls_cert_file` / `tls_key_file` to serve a cert obtained
   out-of-band — e.g. Let's Encrypt via DNS-01. No inbound validation needed.
+- **Custom 502 page**: when a terminated hostname has no live tunnel, the
+  server answers with a proper 502 page instead of dropping the connection
+  — overridable per deployment via `error_502_file`.
+- **Built to stay up**: non-poisoning routing locks, global + per-IP
+  connection caps, accept-loop backpressure, and a liveness probe
+  (`TunnelServer::healthy()`) ready to wire into a systemd watchdog.
 
 ## Build
 
@@ -145,6 +152,9 @@ crates/
 ├── tuyau-server/     QUIC listener + public TLS listener + routing table
 ├── tuyau-client/     QUIC dialer + listener adapter (axum, lib-first)
 └── tuyau-cli/        binary `tuyau` with `server` and `client` subcommands
+sdk/
+└── ts/               TypeScript client SDK (Bun) — serve a local handler
+                      through the tunnel without the Rust CLI
 ```
 
 ## License

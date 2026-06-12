@@ -14,3 +14,4 @@ Cargo.lock.bak
 
 # Runtime artefacts (Claude Code scheduler etc.)
 .claude/scheduled_tasks.lock
+.claude/
