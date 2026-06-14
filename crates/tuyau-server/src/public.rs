@@ -158,14 +158,15 @@ fn build_rustls_config(
     .map_err(ServerError::Tls)?
     .with_no_client_auth()
     .with_cert_resolver(cert_resolver);
+    // Advertise `h2` then `http/1.1` (preference order). We accept h2 from any
+    // client because terminated mode now bridges h2→h1: we terminate h2 here and
+    // talk h1 to the backend (see `h2proxy`), so the backend never needs to speak
+    // h2. Once alpn_protocols is non-empty, rustls rejects a client with no
+    // overlap via a fatal NoApplicationProtocol alert — browsers always offer
+    // h2/http/1.1, so they always match.
+    config.alpn_protocols.push(b"h2".to_vec());
+    config.alpn_protocols.push(b"http/1.1".to_vec());
     if acme_active {
-        // Advertise `http/1.1` first so ordinary clients (browsers always send
-        // an ALPN list of h2/http/1.1) find a common protocol — once
-        // alpn_protocols is non-empty, rustls rejects any client with no
-        // overlap via a fatal NoApplicationProtocol alert. We only offer
-        // http/1.1 (not h2): terminated mode is a transparent byte-pipe to an
-        // arbitrary backend, and http/1.1 is universally understood.
-        config.alpn_protocols.push(b"http/1.1".to_vec());
         // Then `acme-tls/1` so Let's Encrypt's validator picks it during
         // TLS-ALPN-01 challenges and rustls-acme's resolver can answer. ACME
         // validators offer only this, so ordering never collides with browsers.
@@ -296,8 +297,17 @@ async fn handle_public(
 
         // ACME TLS-ALPN-01 challenge: the resolver answered with the challenge
         // cert, the validator closes. No backend dispatch — bail.
-        if tls_stream.get_ref().1.alpn_protocol() == Some(rustls_acme::acme::ACME_TLS_ALPN_NAME) {
+        let alpn = tls_stream.get_ref().1.alpn_protocol();
+        if alpn == Some(rustls_acme::acme::ACME_TLS_ALPN_NAME) {
             tracing::info!(peer = %peer, sni = %sni, "acme-tls/1 challenge served");
+            return Ok(());
+        }
+
+        // h2 negotiated → can't byte-pipe (the backend speaks h1). Terminate h2
+        // and reverse-proxy each request to the backend as h1.
+        if alpn == Some(b"h2".as_slice()) {
+            tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, h2→h1)");
+            crate::h2proxy::serve_h2(tls_stream, routes.clone(), sni.clone(), peer, error_502.clone()).await;
             return Ok(());
         }
 
@@ -364,7 +374,7 @@ where
 }
 
 /// Dial a local upstream over TCP, with a timeout. `None` on failure (logged).
-async fn connect_tcp(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<TcpStream> {
+pub(crate) async fn connect_tcp(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<TcpStream> {
     match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => Some(s),
         Ok(Err(e)) => {
@@ -380,7 +390,7 @@ async fn connect_tcp(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<Tc
 
 /// Dial a local upstream over a Unix domain socket, with a timeout. `None` on
 /// failure (logged).
-async fn connect_unix(path: &Path, sni: &str, peer: SocketAddr) -> Option<UnixStream> {
+pub(crate) async fn connect_unix(path: &Path, sni: &str, peer: SocketAddr) -> Option<UnixStream> {
     match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, UnixStream::connect(path)).await {
         Ok(Ok(s)) => Some(s),
         Ok(Err(e)) => {
@@ -430,7 +440,7 @@ where
 /// Open a bidi QUIC stream on the matched tunnel and send the
 /// `DataStreamHeader` as the first frame. Returns `None` on any failure
 /// (logged); caller drops the connection.
-async fn open_tunnel_stream(
+pub(crate) async fn open_tunnel_stream(
     route: &RouteEntry,
     sni: &str,
     peer: SocketAddr,

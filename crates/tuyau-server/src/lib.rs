@@ -5,6 +5,7 @@ mod cert;
 mod config;
 mod control;
 mod error;
+mod h2proxy;
 mod public;
 mod routes;
 mod server;

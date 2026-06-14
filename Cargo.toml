@@ -33,6 +33,13 @@ async-trait = "0.1"
 # Optional axum integration (behind tuyau-client's `axum` feature).
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 
+# HTTP/2 termination in the public listener: terminate h2 from the browser and
+# downgrade to h1 toward the backend (over the tunnel or a local upstream), so
+# browsers get h2 without backends needing to speak it. Server-side only.
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
