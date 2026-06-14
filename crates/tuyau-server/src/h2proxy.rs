@@ -22,17 +22,17 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::ext::Protocol;
 use hyper::header::{
-    CONNECTION, HOST, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL,
-    SEC_WEBSOCKET_VERSION, UPGRADE,
+    CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE,
 };
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 
 use crate::public::{connect_tcp, connect_unix, open_tunnel_stream};
@@ -41,6 +41,24 @@ use crate::routes::{Route, RoutingTable, UpstreamTarget};
 /// One concrete response-body type for the h2 server: either the backend's
 /// streamed h1 response or a small in-memory page, boxed to unify them.
 type ProxyBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+/// Cap concurrent h2 streams per connection. Each stream maps to one tunnel
+/// stream / backend connection, and a whole h2 connection counts as just one
+/// permit against the global / per-IP connection caps — so without this a single
+/// connection could fan out unboundedly. 256 is generous for a browser (which
+/// opens far fewer) while bounding abuse.
+const MAX_CONCURRENT_STREAMS: u32 = 256;
+/// Bound request header size (HPACK-decoded) so a peer can't force large
+/// allocations. 64 KiB is well above any real browser request.
+const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+/// h2 keep-alive: PING idle peers and reap them if they don't answer, so dead
+/// connections don't pin a permit forever.
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound the h1 handshake to the backend so a hung backend can't stall a stream
+/// during setup. The request/response themselves are not timed out — responses
+/// may legitimately stream for a long time (SSE, downloads).
+const BACKEND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fixed `Sec-WebSocket-Key` for the synthesized h1 handshake to the backend.
 /// The real WebSocket security handshake already happened between the browser
@@ -67,6 +85,12 @@ pub(crate) async fn serve_h2<S>(
         proxy(req, routes.clone(), sni.clone(), peer, error_502.clone())
     });
     let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+    builder
+        .timer(TokioTimer::new()) // required by keep-alive below
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE)
+        .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT);
     // Advertise RFC 8441 so browsers tunnel WebSocket over this h2 connection
     // (Extended CONNECT) instead of failing; we translate it to an h1 upgrade.
     builder.enable_connect_protocol();
@@ -157,10 +181,15 @@ async fn h1_roundtrip<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(io)).await {
-        Ok(pair) => pair,
-        Err(e) => {
+    let handshake = hyper::client::conn::http1::handshake(TokioIo::new(io));
+    let (mut sender, conn) = match tokio::time::timeout(BACKEND_HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
             tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend h1 handshake failed");
+            return bad_gateway(error_502);
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer, sni = %sni, "backend h1 handshake timed out");
             return bad_gateway(error_502);
         }
     };
@@ -222,25 +251,32 @@ where
         .header(UPGRADE, "websocket")
         .header(SEC_WEBSOCKET_VERSION, "13")
         .header(SEC_WEBSOCKET_KEY, WS_KEY);
-    // Carry the browser's subprotocol / extension offers through to the backend.
-    for name in [SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_EXTENSIONS] {
-        if let Some(v) = req.headers().get(&name) {
-            bld = bld.header(name, v);
-        }
+    // Carry the browser's subprotocol offer through to the backend, and echo the
+    // backend's choice back below. We deliberately do NOT forward
+    // Sec-WebSocket-Extensions: the browser negotiated the WS handshake with us
+    // (over h2), and we don't relay the backend's extension response, so letting
+    // the backend negotiate permessage-deflate would desync the two ends. No
+    // extension = always correct.
+    if let Some(v) = req.headers().get(SEC_WEBSOCKET_PROTOCOL) {
+        bld = bld.header(SEC_WEBSOCKET_PROTOCOL, v);
     }
     let breq = match bld.body(Empty::<Bytes>::new()) {
         Ok(r) => r,
         Err(_) => return bad_gateway(error_502),
     };
 
-    let (mut sender, conn) =
-        match hyper::client::conn::http1::handshake(TokioIo::new(backend)).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend ws handshake failed");
-                return bad_gateway(error_502);
-            }
-        };
+    let handshake = hyper::client::conn::http1::handshake(TokioIo::new(backend));
+    let (mut sender, conn) = match tokio::time::timeout(BACKEND_HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend ws handshake failed");
+            return bad_gateway(error_502);
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer, sni = %sni, "backend ws handshake timed out");
+            return bad_gateway(error_502);
+        }
+    };
     // `.with_upgrades()` keeps the connection alive past the 101 so the upgraded
     // byte stream stays usable.
     tokio::spawn(async move {
