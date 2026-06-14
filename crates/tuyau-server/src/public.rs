@@ -307,7 +307,14 @@ async fn handle_public(
         // and reverse-proxy each request to the backend as h1.
         if alpn == Some(b"h2".as_slice()) {
             tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, h2→h1)");
-            crate::h2proxy::serve_h2(tls_stream, routes.clone(), sni.clone(), peer, error_502.clone()).await;
+            crate::h2proxy::serve_h2(
+                tls_stream,
+                routes.clone(),
+                sni.clone(),
+                peer,
+                error_502.clone(),
+            )
+            .await;
             return Ok(());
         }
 
@@ -374,7 +381,11 @@ where
 }
 
 /// Dial a local upstream over TCP, with a timeout. `None` on failure (logged).
-pub(crate) async fn connect_tcp(addr: SocketAddr, sni: &str, peer: SocketAddr) -> Option<TcpStream> {
+pub(crate) async fn connect_tcp(
+    addr: SocketAddr,
+    sni: &str,
+    peer: SocketAddr,
+) -> Option<TcpStream> {
     match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => Some(s),
         Ok(Err(e)) => {

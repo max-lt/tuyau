@@ -81,9 +81,8 @@ pub(crate) async fn serve_h2<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(tls_stream);
-    let service = service_fn(move |req| {
-        proxy(req, routes.clone(), sni.clone(), peer, error_502.clone())
-    });
+    let service =
+        service_fn(move |req| proxy(req, routes.clone(), sni.clone(), peer, error_502.clone()));
     let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
     builder
         .timer(TokioTimer::new()) // required by keep-alive below
@@ -181,8 +180,10 @@ async fn h1_roundtrip<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let req = downgrade_to_h1(req, sni);
     let handshake = hyper::client::conn::http1::handshake(TokioIo::new(io));
-    let (mut sender, conn) = match tokio::time::timeout(BACKEND_HANDSHAKE_TIMEOUT, handshake).await {
+    let (mut sender, conn) = match tokio::time::timeout(BACKEND_HANDSHAKE_TIMEOUT, handshake).await
+    {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend h1 handshake failed");
@@ -206,6 +207,38 @@ where
             bad_gateway(error_502)
         }
     }
+}
+
+/// Rewrite an h2 request into the shape an h1 backend expects: an origin-form
+/// request-target (just path-and-query) plus a `Host` header. An h2 request
+/// carries scheme+authority in its URI and `:authority` (not `Host`), which a
+/// strict h1 server rejects as an absolute-form target (→ 400). We take the
+/// authority for `Host` before stripping it from the URI; SNI is the fallback.
+fn downgrade_to_h1(mut req: Request<Incoming>, sni: &str) -> Request<Incoming> {
+    let authority = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| {
+            req.headers()
+                .get(HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| sni.to_string());
+
+    let origin = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    if let Ok(uri) = origin.parse::<hyper::Uri>() {
+        *req.uri_mut() = uri;
+    }
+    if let Ok(host) = authority.parse() {
+        req.headers_mut().insert(HOST, host);
+    }
+    req
 }
 
 /// Translate a WebSocket-over-h2 (Extended CONNECT) stream into an HTTP/1.1
@@ -266,7 +299,8 @@ where
     };
 
     let handshake = hyper::client::conn::http1::handshake(TokioIo::new(backend));
-    let (mut sender, conn) = match tokio::time::timeout(BACKEND_HANDSHAKE_TIMEOUT, handshake).await {
+    let (mut sender, conn) = match tokio::time::timeout(BACKEND_HANDSHAKE_TIMEOUT, handshake).await
+    {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend ws handshake failed");
@@ -330,7 +364,9 @@ where
 
 /// An empty boxed body for the WebSocket `200` response.
 fn empty_body() -> ProxyBody {
-    Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 /// A 502 response carrying the (branded) error page, mirroring the byte-pipe's

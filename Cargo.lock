@@ -2068,7 +2068,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tuyau-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "tuyau-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "tuyau-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ciborium",
  "serde",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "tuyau-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",

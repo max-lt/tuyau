@@ -28,7 +28,20 @@ async fn spawn_h1_backend() -> std::net::SocketAddr {
             };
             tokio::spawn(async move {
                 let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
-                    let body = format!("hello from backend: {} {}", req.method(), req.uri().path());
+                    // Echo method, path and Host so the test can assert the h2
+                    // request was downgraded to a well-formed h1 one (origin-form
+                    // target + Host header, not absolute-form / :authority).
+                    let host = req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("<none>");
+                    let body = format!(
+                        "hello from backend: {} {} host={}",
+                        req.method(),
+                        req.uri().path(),
+                        host
+                    );
                     Ok::<_, hyper::Error>(Response::new(body))
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
@@ -184,12 +197,10 @@ async fn h2_browser_reaches_h1_backend() {
     );
 
     // Speak HTTP/2 to tuyau.
-    let (mut sender, conn) = hyper::client::conn::http2::handshake(
-        TokioExecutor::new(),
-        TokioIo::new(tls_stream),
-    )
-    .await
-    .unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+            .await
+            .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -203,8 +214,8 @@ async fn h2_browser_reaches_h1_backend() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&body);
     assert_eq!(
-        text, "hello from backend: GET /hello",
-        "backend saw the request as h1 GET, proxied from the h2 client"
+        text, "hello from backend: GET /hello host=front.example.com",
+        "backend saw a well-formed h1 GET (origin-form + Host), proxied from h2"
     );
 
     server.shutdown().await;
@@ -212,7 +223,9 @@ async fn h2_browser_reaches_h1_backend() {
 
 /// Start a terminated public listener whose only route is a local upstream to
 /// `backend`. Returns the running server and its public address.
-async fn start_terminated_to(backend: std::net::SocketAddr) -> (TunnelServer, std::net::SocketAddr) {
+async fn start_terminated_to(
+    backend: std::net::SocketAddr,
+) -> (TunnelServer, std::net::SocketAddr) {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = ServerConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -276,7 +289,8 @@ async fn websocket_over_h2_bridges_to_h1_upgrade() {
         .uri("https://front.example.com/ws")
         .body(Empty::<Bytes>::new())
         .unwrap();
-    req.extensions_mut().insert(Protocol::from_static("websocket"));
+    req.extensions_mut()
+        .insert(Protocol::from_static("websocket"));
 
     let resp = sender.send_request(req).await.unwrap();
     assert_eq!(resp.status(), 200, "RFC 8441 success is 200, not 101");
