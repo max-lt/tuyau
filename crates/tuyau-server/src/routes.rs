@@ -66,8 +66,16 @@ pub struct RoutingTable {
     /// Hostnames the server terminates TLS for — the KNOWN set (config + the
     /// dynamic seam). The public listener decides "terminate this SNI?" from
     /// this (so an ACME challenge / the cert is served regardless of whether a
-    /// tunnel is currently routed), and the ACME domain list mirrors it.
+    /// tunnel is currently routed), and the ACME domain list mirrors it. Holds
+    /// BOTH `terminated` (HTTP) and `tls_offload` hostnames — both terminate TLS
+    /// and need a cert; they differ only in what happens *after* termination.
     terminated: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// The subset of terminated hostnames in `tls_offload` mode: after TLS
+    /// termination the plaintext is byte-piped to the backend with no HTTP
+    /// parsing (no h2 bridge, no HTTP 502). Config-only (static) — the dynamic
+    /// seam provisions HTTP-terminated hosts and never touches this set, so a
+    /// configured offload host survives a dynamic `set_terminated` replacement.
+    offload: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl RoutingTable {
@@ -87,16 +95,30 @@ impl RoutingTable {
                 Some((u.host.clone(), LocalUpstream { target }))
             })
             .collect();
-        // Seed the terminated set with every terminated hostname known from
-        // config — tunnel-routed (`hostnames`) AND local upstreams.
+        // A hostname needs TLS termination (a cert) in both `terminated` and
+        // `tls_offload` mode — they only diverge after the handshake. Seed the
+        // termination set with both, from tunnel routes AND local upstreams.
+        let terminates = |m: TlsMode| matches!(m, TlsMode::Terminated | TlsMode::TlsOffload);
         let terminated = hostnames
             .iter()
-            .filter(|h| h.tls_mode == TlsMode::Terminated)
+            .filter(|h| terminates(h.tls_mode))
             .map(|h| h.host.to_ascii_lowercase())
             .chain(
                 upstreams
                     .iter()
-                    .filter(|u| u.tls_mode == TlsMode::Terminated)
+                    .filter(|u| terminates(u.tls_mode))
+                    .map(|u| u.host.to_ascii_lowercase()),
+            )
+            .collect();
+        // The offload subset: terminate TLS, then byte-pipe plaintext (no HTTP).
+        let offload = hostnames
+            .iter()
+            .filter(|h| h.tls_mode == TlsMode::TlsOffload)
+            .map(|h| h.host.to_ascii_lowercase())
+            .chain(
+                upstreams
+                    .iter()
+                    .filter(|u| u.tls_mode == TlsMode::TlsOffload)
                     .map(|u| u.host.to_ascii_lowercase()),
             )
             .collect();
@@ -104,13 +126,22 @@ impl RoutingTable {
             inner: Arc::new(RwLock::new(HashMap::new())),
             local: Arc::new(local),
             terminated: Arc::new(RwLock::new(terminated)),
+            offload: Arc::new(RwLock::new(offload)),
         }
     }
 
     /// Whether the server terminates TLS for `host` (it's in the known set).
-    /// Case-insensitive — DNS hostnames are, and clients/LE lowercase the SNI.
+    /// True for both HTTP-`terminated` and `tls_offload` hostnames — both hold a
+    /// cert and complete the handshake here. Case-insensitive — DNS hostnames
+    /// are, and clients/LE lowercase the SNI.
     pub fn is_terminated(&self, host: &str) -> bool {
         self.terminated.read().contains(&host.to_ascii_lowercase())
+    }
+
+    /// Whether `host` is in `tls_offload` mode: terminate TLS, then byte-pipe
+    /// the plaintext with no HTTP parsing. A subset of `is_terminated`.
+    pub fn is_offload(&self, host: &str) -> bool {
+        self.offload.read().contains(&host.to_ascii_lowercase())
     }
 
     /// Replace the whole terminated set. The caller (the dynamic seam) passes the

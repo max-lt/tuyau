@@ -16,14 +16,21 @@ pub enum HelloResponse {
 /// TLS handling for a given hostname.
 ///
 /// - `Terminated`: the tuyau-server holds a cert for the hostname, terminates
-///   incoming TLS, and forwards the *plaintext* bytes over the tunnel.
+///   incoming TLS, and reverse-proxies the decrypted **HTTP** to the backend
+///   (h2→h1 bridge, HTTP 502 when no backend is live). For web apps.
+/// - `TlsOffload`: the tuyau-server terminates TLS exactly like `Terminated`,
+///   but then byte-pipes the **plaintext** straight through — no HTTP parsing.
+///   The backend speaks any cleartext protocol (Postgres, Redis, MQTT…) and
+///   never sees TLS; tuyau owns the certificate (ACME). For non-HTTP services.
 /// - `Passthrough`: the tuyau-server only peeks the SNI for routing and
-///   forwards the raw TLS bytes (including ClientHello) over the tunnel.
+///   forwards the raw TLS bytes (including ClientHello) over the tunnel — it
+///   never decrypts, so the backend terminates its own TLS, end to end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsMode {
     #[default]
     Terminated,
+    TlsOffload,
     Passthrough,
 }
 

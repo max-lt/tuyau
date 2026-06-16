@@ -32,9 +32,12 @@ a local service.
   server either hands over to the newest (`last-write-wins`, default — clean
   reconnects) or spreads public connections across them (`round-robin` —
   active-active fan-out / HA), set per `[[clients]]` entry.
-- **Two TLS modes per hostname**: `terminated` (server decrypts, plaintext
-  flows over the tunnel) or `passthrough` (server only peeks the SNI, raw
-  TLS bytes flow over the tunnel — the server never sees plaintext).
+- **Three TLS modes per hostname**: `terminated` (server decrypts and
+  reverse-proxies HTTP — h2→h1 bridge), `tls_offload` (server decrypts and
+  byte-pipes the plaintext to a cleartext, non-HTTP backend — Postgres, Redis,
+  MQTT… — so the backend never deals with certificates), or `passthrough`
+  (server only peeks the SNI, raw TLS bytes flow over the tunnel — the server
+  never sees plaintext).
 - **Library-first client**: `tuyau-client` is a Rust crate. With the `axum`
   feature, swap a `TcpListener` for a `TunnelListener` in one line and serve
   your existing axum/hyper app through the tunnel. CLI is a thin wrapper

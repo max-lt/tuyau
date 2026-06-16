@@ -117,17 +117,20 @@ impl TunnelServer {
             Some(addr) => {
                 // Hostnames the server terminates TLS for — from tunnel routes
                 // AND static local upstreams. ACME / the cert resolver needs the
-                // full set so it can answer for every terminated name.
+                // full set so it can answer for every terminated name. Both
+                // `terminated` (HTTP) and `tls_offload` hold a cert here.
+                let terminates =
+                    |m: TlsMode| matches!(m, TlsMode::Terminated | TlsMode::TlsOffload);
                 let terminated_hostnames: Vec<String> = config
                     .hostnames
                     .iter()
-                    .filter(|h| h.tls_mode == TlsMode::Terminated)
+                    .filter(|h| terminates(h.tls_mode))
                     .map(|h| h.host.clone())
                     .chain(
                         config
                             .upstreams
                             .iter()
-                            .filter(|u| u.tls_mode == TlsMode::Terminated)
+                            .filter(|u| terminates(u.tls_mode))
                             .map(|u| u.host.clone()),
                     )
                     .collect();

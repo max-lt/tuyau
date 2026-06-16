@@ -104,11 +104,18 @@ pub struct HostnameEntry {
 
 /// A static local upstream: a hostname served by forwarding to a local address
 /// instead of a client tunnel. Lets the server front existing local services —
-/// e.g. route `db.example.com` to `127.0.0.1:8443`. `passthrough` forwards the
-/// raw TLS bytes (the upstream terminates its own TLS, so this box never sees
-/// plaintext); `terminated` has the server terminate TLS (it must hold a cert
-/// for the host) and forward plaintext. Local upstreams win over tunnel routes
-/// for the same host, so a dynamic client can't hijack one.
+/// e.g. route `db.example.com` to `127.0.0.1:8443`. `tls_mode` picks how TLS is
+/// handled:
+/// - `passthrough` forwards the raw TLS bytes (the upstream terminates its own
+///   TLS, so this box never sees plaintext);
+/// - `terminated` has the server terminate TLS (it must hold a cert for the
+///   host) and reverse-proxy the decrypted **HTTP** to the upstream;
+/// - `tls_offload` terminates TLS the same way but byte-pipes the **plaintext**
+///   with no HTTP parsing — for a cleartext non-HTTP upstream (Postgres,
+///   Redis, MQTT…) that should not deal with certificates itself.
+///
+/// Local upstreams win over tunnel routes for the same host, so a dynamic
+/// client can't hijack one.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamEntry {
     pub host: String,
@@ -275,6 +282,23 @@ mod tests {
         assert_eq!(cfg.hostnames[0].host, "alpha.example.com");
         assert_eq!(cfg.hostnames[0].tls_mode, TlsMode::Terminated);
         assert_eq!(cfg.hostnames[1].tls_mode, TlsMode::Passthrough);
+    }
+
+    #[test]
+    fn parses_tls_offload_mode() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:4433"
+            [[clients]]
+            name = "a"
+            token = "0000000000000000000000000000000000000000000000000000000000000001"
+            [[hostnames]]
+            host = "db.example.com"
+            client = "a"
+            tls_mode = "tls_offload"
+        "#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.hostnames[0].tls_mode, TlsMode::TlsOffload);
     }
 
     #[test]

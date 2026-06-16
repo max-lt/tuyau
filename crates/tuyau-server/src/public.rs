@@ -9,7 +9,11 @@
 //!    bytes we already consumed.
 //! 5. Branch on TLS mode:
 //!    - `Terminated`: feed the prefixed stream to `LazyConfigAcceptor`,
-//!      complete TLS with the server's public cert, pipe plaintext over QUIC.
+//!      complete TLS with the server's public cert, then reverse-proxy the
+//!      decrypted HTTP to the backend (h2→h1 bridge; HTTP 502 if none live).
+//!    - `TlsOffload`: terminate TLS the same way, but byte-pipe the plaintext
+//!      straight over QUIC — no HTTP parsing. The backend speaks any cleartext
+//!      protocol and never sees TLS; tuyau owns the cert (ACME).
 //!    - `Passthrough`: never terminate; pipe the raw bytes (ClientHello
 //!      included) over QUIC straight to the owning client. The server never
 //!      sees plaintext — the privacy property of the managed-B2B tier.
@@ -303,9 +307,18 @@ async fn handle_public(
             return Ok(());
         }
 
+        // tls_offload mode: TLS is terminated (cert = ours), but the protocol
+        // on top is NOT HTTP — byte-pipe the plaintext straight to the backend,
+        // skipping the h2 bridge and the HTTP 502. The backend speaks cleartext
+        // Postgres/Redis/MQTT/… and never sees TLS. One generic path, no
+        // per-protocol code. (A client that offers a non-matching ALPN gets a
+        // fatal NoApplicationProtocol from rustls; offload clients send none.)
+        let offload = routes.is_offload(&sni);
+
         // h2 negotiated → can't byte-pipe (the backend speaks h1). Terminate h2
-        // and reverse-proxy each request to the backend as h1.
-        if alpn == Some(b"h2".as_slice()) {
+        // and reverse-proxy each request to the backend as h1. Never for offload
+        // (that host isn't HTTP — pipe its plaintext as-is below).
+        if !offload && alpn == Some(b"h2".as_slice()) {
             tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, h2→h1)");
             crate::h2proxy::serve_h2(
                 tls_stream,
@@ -329,6 +342,11 @@ async fn handle_public(
             Some(Route::Local { target, .. }) => {
                 tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, local)");
                 dispatch_local(tls_stream, &target, &sni, peer).await;
+            }
+            None if offload => {
+                // No HTTP semantics on an offload host — a 502 page would be
+                // garbage to a Postgres/Redis client. Just drop the connection.
+                tracing::info!(peer = %peer, sni = %sni, "tls_offload, no live route — dropping");
             }
             None => {
                 tracing::info!(peer = %peer, sni = %sni, "terminated, no live route — serving 502");
