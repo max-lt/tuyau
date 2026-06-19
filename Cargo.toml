@@ -19,7 +19,9 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-rustls-acme = { version = "0.13", default-features = false, features = ["ring", "tokio"] }
+# webpki-roots is explicit: it's in 0.15's `default` (which we opt out of), and
+# the ACME client needs roots to validate Let's Encrypt's HTTPS directory.
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
 rcgen = "0.13"
 sha2 = "0.10"
 
@@ -74,9 +76,3 @@ tuyau-protocol = { path = "crates/tuyau-protocol" }
 tuyau-server = { path = "crates/tuyau-server" }
 tuyau-client = { path = "crates/tuyau-client" }
 tuyau-cli = { path = "crates/tuyau-cli" }
-
-# Local patch of rustls-acme 0.13.0: adds a catch-all `Unknown` variant to
-# ChallengeType so Let's Encrypt's newer challenge types (e.g. dns-persist-01)
-# don't break deserialization of the challenges array. See vendor/rustls-acme.
-[patch.crates-io]
-rustls-acme = { path = "vendor/rustls-acme" }
