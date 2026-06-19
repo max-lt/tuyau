@@ -99,7 +99,7 @@ token = "<openssl rand -hex 32>"
 [[hostnames]]
 host = "alpha.example.com"
 client = "service-a"
-# tls_mode = "terminated"   # default; or "passthrough"
+# tls_mode = "terminated"   # default; also "tls_offload" or "passthrough"
 ```
 
 ```bash
