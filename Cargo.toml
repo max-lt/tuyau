@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
@@ -69,7 +69,6 @@ anyhow = "1"
 
 # Crypto utility
 subtle = "2"
-rand = "0.8"
 
 # Non-poisoning locks (hot-path routing table / resolver): a panic while a guard
 # is held must NOT poison the lock and cascade into "all routing dead".
