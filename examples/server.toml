@@ -85,3 +85,42 @@ tls_mode = "passthrough"
 #
 # tls_cert_file = "/etc/letsencrypt/live/alpha.example.com/fullchain.pem"
 # tls_key_file  = "/etc/letsencrypt/live/alpha.example.com/privkey.pem"
+
+# ---------------------------------------------------------------------------
+# Public UDP routes.
+#
+# UDP has no SNI and no connections, so routing is per-port: each [[udp]] entry
+# binds its own UDP socket and everything arriving there belongs to that route.
+# `name` is the routing key on the wire — the tunnel client matches it against
+# its own [[udp_ingress]] to pick a local service (the UDP counterpart of a
+# hostname). Each entry names exactly one destination: a `client` (forward over
+# that client's tunnel) or a `local_addr` (forward to a service on this box).
+#
+# The QUIC tunnel above is itself UDP, so a [[udp]] route can't share
+# `listen_addr` — config validation rejects that rather than letting one
+# silently eat the other. To put WireGuard on the restricted-network-friendly
+# UDP/443, move the tunnel elsewhere (4433 here) or give it its own IP.
+#
+# Expose a WireGuard server that lives behind a tuyau-client:
+# [[udp]]
+# name = "wireguard"
+# listen_addr = "0.0.0.0:443"
+# client = "service-a"
+# idle_timeout_secs = 120   # drop a session after this long with no traffic
+# max_sessions = 4096       # ceiling on the session table (addresses are
+#                           # spoofable, so it must be bounded)
+#
+# Front a local UDP service directly, no tunnel — the UDP counterpart of
+# [[upstreams]]:
+# [[udp]]
+# name = "dns"
+# listen_addr = "0.0.0.0:5353"
+# local_addr = "127.0.0.1:53"
+# # Until a peer proves it is really at its source address (it keeps sending
+# # after a reply), tuyau sends it at most `amplification_factor` bytes per byte
+# # received — the same rule QUIC applies to unvalidated paths. The default of 3
+# # blocks the reflection-amplification shape, but also blocks protocols whose
+# # first answer dwarfs its question. DNS is exactly that (and exactly the
+# # protocol attackers reflect), so raising it here is a deliberate trade: the
+# # port can then amplify that much toward a spoofed victim.
+# amplification_factor = 20

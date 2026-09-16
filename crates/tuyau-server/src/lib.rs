@@ -10,9 +10,12 @@ mod public;
 mod routes;
 mod server;
 mod sni;
+mod udp;
 
 pub use config::{
-    AcmeSection, Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, UpstreamEntry,
+    AcmeSection, Balance, ClientEntry, DEFAULT_UDP_AMPLIFICATION_FACTOR,
+    DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_MAX_SESSIONS, HostnameEntry, ServerConfig, TlsMode,
+    UdpEntry, UpstreamEntry,
 };
 pub use error::{CertError, ConfigError, ServerError};
 pub use server::TunnelServer;

@@ -2094,6 +2094,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hostname",
+ "parking_lot",
  "pin-project-lite",
  "quinn",
  "rcgen",

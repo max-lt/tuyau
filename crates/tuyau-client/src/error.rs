@@ -52,4 +52,7 @@ pub enum ConfigError {
 
     #[error("ingress[{index}]: {reason}")]
     InvalidIngress { index: usize, reason: String },
+
+    #[error("udp_ingress[{index}]: {reason}")]
+    InvalidUdpIngress { index: usize, reason: String },
 }

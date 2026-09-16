@@ -57,9 +57,28 @@ struct HostRoutes {
     cursor: AtomicUsize,
 }
 
+/// All tunnels currently serving one UDP route. Same ownership rules as
+/// [`HostRoutes`], minus the TLS mode (UDP never terminates TLS): one client
+/// owns a route at a time, and `balance` decides whether a new tunnel replaces
+/// the incumbent or joins it.
+///
+/// The cursor picks a tunnel once per *session*, not per datagram: a UDP
+/// session is stateful on the far side (a WireGuard peer, a DNS transaction),
+/// so spraying its packets across tunnels would break it.
+#[derive(Debug)]
+struct UdpRoutes {
+    client_name: String,
+    conns: Vec<quinn::Connection>,
+    cursor: AtomicUsize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RoutingTable {
     inner: Arc<RwLock<HashMap<String, HostRoutes>>>,
+    /// Tunnel routes for `[[udp]]` entries, keyed by route name. Separate from
+    /// `inner`: UDP routes are named by config, not by SNI, and the two
+    /// namespaces never mix.
+    udp: Arc<RwLock<HashMap<String, UdpRoutes>>>,
     /// Static local upstreams, fixed at construction (never change at runtime,
     /// unlike tunnel routes). Take precedence over tunnels in `lookup`.
     local: Arc<HashMap<String, LocalUpstream>>,
@@ -124,6 +143,7 @@ impl RoutingTable {
             .collect();
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            udp: Arc::new(RwLock::new(HashMap::new())),
             local: Arc::new(local),
             terminated: Arc::new(RwLock::new(terminated)),
             offload: Arc::new(RwLock::new(offload)),
@@ -166,17 +186,18 @@ impl RoutingTable {
     pub fn install(
         &self,
         hosts: Vec<(String, TlsMode)>,
+        udp_routes: &[String],
         client_name: &str,
         balance: Balance,
         conn: &quinn::Connection,
     ) -> Vec<quinn::Connection> {
+        let mut displaced = self.install_udp(udp_routes, client_name, balance, conn);
         if hosts.is_empty() {
-            return Vec::new();
+            return displaced;
         }
 
         let mut guard = self.inner.write();
         let new_id = conn.stable_id();
-        let mut displaced: Vec<quinn::Connection> = Vec::new();
 
         for (host, tls_mode) in hosts {
             let entry = guard.entry(host).or_insert_with(|| HostRoutes {
@@ -221,15 +242,104 @@ impl RoutingTable {
             }
         }
 
+        dedup_conns(displaced)
+    }
+
+    /// The UDP half of [`install`](Self::install), with identical ownership and
+    /// balance semantics. Returns the connections it displaced.
+    fn install_udp(
+        &self,
+        routes: &[String],
+        client_name: &str,
+        balance: Balance,
+        conn: &quinn::Connection,
+    ) -> Vec<quinn::Connection> {
+        if routes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut guard = self.udp.write();
+        let new_id = conn.stable_id();
+        let mut displaced: Vec<quinn::Connection> = Vec::new();
+
+        for route in routes {
+            let entry = guard.entry(route.clone()).or_insert_with(|| UdpRoutes {
+                client_name: client_name.to_string(),
+                conns: Vec::new(),
+                cursor: AtomicUsize::new(0),
+            });
+
+            // Same rule as hostnames: two identities must never coexist under
+            // one route.
+            if entry.client_name != client_name {
+                tracing::warn!(
+                    previous_client = %entry.client_name,
+                    new_client = %client_name,
+                    udp_route = %route,
+                    "udp route reassigned to a different client; evicting previous owner's tunnels"
+                );
+                displaced.append(&mut entry.conns);
+                entry.client_name = client_name.to_string();
+            }
+
+            match balance {
+                Balance::LastWriteWins => {
+                    for c in entry.conns.drain(..) {
+                        if c.stable_id() != new_id {
+                            displaced.push(c);
+                        }
+                    }
+                    entry.conns.push(conn.clone());
+                }
+                Balance::RoundRobin => {
+                    if !entry.conns.iter().any(|c| c.stable_id() == new_id) {
+                        entry.conns.push(conn.clone());
+                    }
+                }
+            }
+        }
+
         displaced
+    }
+
+    /// Pick a live tunnel for a UDP route, round-robining across the route's
+    /// connections and skipping any already known closed. `None` when no tunnel
+    /// currently serves it — the caller drops the datagram (UDP has no way to
+    /// say "no backend", and inventing one would be an amplification vector).
+    pub fn lookup_udp(&self, route: &str) -> Option<(String, quinn::Connection)> {
+        let guard = self.udp.read();
+        let entry = guard.get(route)?;
+        let n = entry.conns.len();
+        if n == 0 {
+            return None;
+        }
+        for _ in 0..n {
+            let idx = entry.cursor.fetch_add(1, Ordering::Relaxed) % n;
+            let conn = &entry.conns[idx];
+            if conn.close_reason().is_none() {
+                return Some((entry.client_name.clone(), conn.clone()));
+            }
+        }
+        None
+    }
+
+    /// Sorted snapshot of UDP route names with at least one live tunnel.
+    pub fn active_udp_routes(&self) -> Vec<String> {
+        let guard = self.udp.read();
+        let mut routes: Vec<String> = guard.keys().cloned().collect();
+        routes.sort();
+        routes
     }
 
     /// Remove every connection matching `stable_id` from all hosts, dropping
     /// any host left with no connections. Called when a tunnel closes
     /// (peer-initiated, timeout, or shutdown).
     pub fn remove_conn(&self, stable_id: usize) {
-        let mut guard = self.inner.write();
-        guard.retain(|_, entry| {
+        self.inner.write().retain(|_, entry| {
+            entry.conns.retain(|c| c.stable_id() != stable_id);
+            !entry.conns.is_empty()
+        });
+        self.udp.write().retain(|_, entry| {
             entry.conns.retain(|c| c.stable_id() != stable_id);
             !entry.conns.is_empty()
         });
@@ -240,10 +350,9 @@ impl RoutingTable {
     /// hosts) so the caller can close them. Used for control-plane revocation.
     #[cfg(feature = "dynamic")]
     pub fn kick(&self, client_name: &str) -> Vec<quinn::Connection> {
-        let mut guard = self.inner.write();
         let mut conns: Vec<quinn::Connection> = Vec::new();
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        guard.retain(|_, entry| {
+        self.inner.write().retain(|_, entry| {
             if entry.client_name == client_name {
                 for c in &entry.conns {
                     if seen.insert(c.stable_id()) {
@@ -251,6 +360,18 @@ impl RoutingTable {
                     }
                 }
                 false // drop this host entry
+            } else {
+                true
+            }
+        });
+        self.udp.write().retain(|_, entry| {
+            if entry.client_name == client_name {
+                for c in &entry.conns {
+                    if seen.insert(c.stable_id()) {
+                        conns.push(c.clone());
+                    }
+                }
+                false // drop this udp route entry
             } else {
                 true
             }
@@ -305,6 +426,17 @@ impl RoutingTable {
     }
 }
 
+/// Drop repeats by connection id. One tunnel can be displaced under several
+/// hostnames *and* UDP routes at once; the caller closes what comes back, and a
+/// duplicate would just log a second, confusing "kicking previous connection".
+fn dedup_conns(conns: Vec<quinn::Connection>) -> Vec<quinn::Connection> {
+    let mut seen = std::collections::HashSet::new();
+    conns
+        .into_iter()
+        .filter(|c| seen.insert(c.stable_id()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,9 +469,20 @@ mod tests {
         .join();
         assert!(res.is_err());
 
+        // And for the UDP route map — it sits on the datagram hot path.
+        let t = table.clone();
+        let res = std::thread::spawn(move || {
+            let _g = t.udp.write();
+            panic!("boom while holding the udp lock");
+        })
+        .join();
+        assert!(res.is_err());
+
         // The table must still answer — not panic on a poisoned lock.
         assert!(table.lookup("anything.example.com").is_none());
         assert!(!table.is_terminated("anything.example.com"));
         assert!(table.active_hostnames().is_empty());
+        assert!(table.lookup_udp("wg").is_none());
+        assert!(table.active_udp_routes().is_empty());
     }
 }

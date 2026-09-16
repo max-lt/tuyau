@@ -23,6 +23,7 @@ async fn spin_up_server_with(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
@@ -70,6 +71,7 @@ fn client_config_for(
         token,
         client_name: "alice".into(),
         ingress: vec![],
+        udp_ingress: vec![],
     }
 }
 
@@ -130,6 +132,7 @@ async fn fails_on_unreachable_server() {
         token: VALID_TOKEN,
         client_name: "alice".into(),
         ingress: vec![],
+        udp_ingress: vec![],
     };
 
     let err = TunnelClient::connect(cfg).await.unwrap_err();

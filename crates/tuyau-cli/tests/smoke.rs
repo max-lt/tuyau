@@ -23,6 +23,7 @@ async fn end_to_end_handshake() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
@@ -51,6 +52,7 @@ async fn end_to_end_handshake() {
         token: TOKEN,
         client_name: "service-a".into(),
         ingress: vec![],
+        udp_ingress: vec![],
     };
 
     let client = TunnelClient::connect(client_cfg)

@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "embedded-axum".into()),
         // No [[ingress]] — we are not forwarding; we serve directly.
         ingress: vec![],
+        udp_ingress: vec![],
     };
 
     let tunnel = TunnelClient::connect(cfg).await?;

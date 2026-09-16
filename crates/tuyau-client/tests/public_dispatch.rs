@@ -38,6 +38,7 @@ async fn spin_up_with_public(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
@@ -64,6 +65,7 @@ async fn connect_tunnel_with(
         token: TOKEN,
         client_name: "service-a".into(),
         ingress,
+        udp_ingress: vec![],
     };
     TunnelClient::connect(cfg).await.unwrap()
 }
@@ -346,6 +348,7 @@ async fn local_upstream_passthrough_forwards_to_local_service() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         clients: vec![], // front-only: no tunnel clients
         hostnames: vec![],
         upstreams: vec![UpstreamEntry {
@@ -432,6 +435,7 @@ async fn local_upstream_unix_socket_terminated_forwards_to_service() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         clients: vec![],
         hostnames: vec![],
         upstreams: vec![UpstreamEntry {
@@ -793,6 +797,7 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
         clients: vec![
             ClientEntry {
@@ -831,6 +836,7 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
                 host: host.into(),
                 local_addr: local.to_string(),
             }],
+            udp_ingress: vec![],
         };
         async move { TunnelClient::connect(cfg).await.unwrap() }
     };
@@ -890,6 +896,7 @@ async fn round_robin_spreads_public_connections_across_tunnels() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),

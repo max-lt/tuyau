@@ -16,6 +16,11 @@ services:
     image: tuyau:latest # built from the repo Dockerfile: `docker build -t tuyau .`
     # --ingress maps each public hostname to a local service. Repeatable.
     # Here "app" is another service on the compose network.
+    #
+    # --udp-ingress does the same for UDP, keyed by the [[udp]] route name from
+    # server.toml rather than a hostname (UDP has no SNI, so the server routes
+    # per port and names each route). Also repeatable, e.g.:
+    #   "--udp-ingress", "wireguard=wg:51820"
     command: ["client", "--ingress", "alpha.example.com=app:8080"]
     environment:
       TUYAU_SERVER: "tunnel.example.com:4433"

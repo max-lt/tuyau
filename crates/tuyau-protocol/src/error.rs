@@ -10,6 +10,15 @@ pub enum ProtocolError {
 
     #[error("oversized frame: {len} bytes (max {max})")]
     OversizedFrame { len: usize, max: usize },
+
+    #[error("truncated udp datagram: {len} bytes")]
+    TruncatedDatagram { len: usize },
+
+    #[error("unknown udp datagram version: {0}")]
+    UnknownDatagramVersion(u8),
+
+    #[error("invalid udp route name: {0}")]
+    InvalidUdpRoute(String),
 }
 
 impl ProtocolError {

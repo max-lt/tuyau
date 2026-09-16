@@ -1,10 +1,13 @@
-//! Tuyau wire protocol: handshake frames + length-delimited CBOR codec.
+//! Tuyau wire protocol: handshake frames + length-delimited CBOR codec, plus
+//! the binary encapsulation used for UDP forwarding over QUIC datagrams.
 
 mod codec;
+mod datagram;
 mod error;
 mod frame;
 
 pub use codec::{FrameCodec, read_frame};
+pub use datagram::{MAX_UDP_ROUTE_LEN, UDP_DATAGRAM_VERSION, UdpDatagram};
 pub use error::ProtocolError;
 pub use frame::{DataStreamHeader, Hello, HelloResponse, TlsMode};
 

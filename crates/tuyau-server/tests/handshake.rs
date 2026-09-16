@@ -28,6 +28,7 @@ async fn spin_up_server() -> (TunnelServer, TempDir) {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
@@ -276,6 +277,7 @@ async fn fingerprint_stable_across_restarts() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "a".into(),

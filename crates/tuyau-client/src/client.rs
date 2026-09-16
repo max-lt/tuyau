@@ -12,6 +12,7 @@ use tuyau_protocol::{ALPN, DataStreamHeader, FrameCodec, Hello, HelloResponse, r
 
 use crate::config::ClientConfig;
 use crate::error::ClientError;
+use crate::udp::UdpForwarder;
 use crate::verifier::PinningCertVerifier;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -42,6 +43,8 @@ pub struct TunnelClient {
     connection: quinn::Connection,
     endpoint: Endpoint,
     ingress: Arc<HashMap<String, String>>,
+    /// UDP route name → local `host:port`, from `[[udp_ingress]]`.
+    udp_ingress: Arc<HashMap<String, String>>,
 }
 
 impl TunnelClient {
@@ -94,6 +97,14 @@ impl TunnelClient {
             .collect();
         let ingress = Arc::new(ingress);
 
+        let udp_ingress: Arc<HashMap<String, String>> = Arc::new(
+            config
+                .udp_ingress
+                .iter()
+                .map(|r| (r.name.clone(), r.local_addr.clone()))
+                .collect(),
+        );
+
         let (send, recv) = connection.open_bi().await?;
         let mut writer = FramedWrite::new(send, FrameCodec::<Hello>::new());
         let mut reader = FramedRead::new(recv, FrameCodec::<HelloResponse>::new());
@@ -122,6 +133,7 @@ impl TunnelClient {
                     connection,
                     endpoint,
                     ingress,
+                    udp_ingress,
                 })
             }
             HelloResponse::Reject { reason } => {
@@ -182,15 +194,31 @@ impl TunnelClient {
         Ok(TunnelStream { header, send, recv })
     }
 
-    /// Run the ingress forward loop until the tunnel connection ends.
+    /// Run the ingress forward loops until the tunnel connection ends.
     ///
-    /// Accepts server-initiated streams, looks each up in the configured
-    /// ingress map by hostname, dials the local service, and pipes bytes both
-    /// ways. Per-stream failures (no ingress rule, local service down, bad
-    /// header) are logged and the stream dropped — they do not stop the loop.
+    /// Two loops run concurrently over the same tunnel:
+    ///
+    /// - **Streams (TCP).** Accepts server-initiated streams, looks each up in
+    ///   the configured ingress map by hostname, dials the local service, and
+    ///   pipes bytes both ways.
+    /// - **Datagrams (UDP).** Reads QUIC datagrams, maps each to a local UDP
+    ///   service by route name, and pumps replies back (see [`crate::udp`]).
+    ///
+    /// Per-stream / per-datagram failures (no ingress rule, local service down,
+    /// bad header) are logged and dropped — they do not stop either loop.
     /// Returns `Ok(())` when the tunnel connection closes (any reason); no
     /// reconnect is attempted (the orchestrator restarts the process).
     pub async fn serve(&self) -> Result<(), ClientError> {
+        let udp = UdpForwarder::new(self.connection.clone(), Arc::clone(&self.udp_ingress));
+        // Both loops end when the connection does; whichever notices first wins
+        // and the other is dropped.
+        tokio::select! {
+            res = self.serve_streams() => res,
+            () = udp.run() => Ok(()),
+        }
+    }
+
+    async fn serve_streams(&self) -> Result<(), ClientError> {
         loop {
             match self.accept_bi().await {
                 Ok(stream) => {

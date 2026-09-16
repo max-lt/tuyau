@@ -14,11 +14,26 @@ pub struct ClientConfig {
     /// `host:port`. Purely client-side — never sent to the server.
     #[serde(default)]
     pub ingress: Vec<IngressRule>,
+    /// UDP forwarding rules: which server-side `[[udp]]` route maps to which
+    /// local UDP `host:port`. Purely client-side, like `ingress`.
+    #[serde(default)]
+    pub udp_ingress: Vec<UdpIngressRule>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngressRule {
     pub host: String,
+    pub local_addr: String,
+}
+
+/// Maps one server-side UDP route to a local UDP service.
+///
+/// `name` is the routing key: UDP has no SNI, so the server routes per port and
+/// names each route in its `[[udp]]` config; that name rides every datagram and
+/// is matched here. It is the UDP counterpart of `IngressRule`'s `host`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UdpIngressRule {
+    pub name: String,
     pub local_addr: String,
 }
 
@@ -35,6 +50,16 @@ impl ClientConfig {
         for (i, rule) in self.ingress.iter().enumerate() {
             validate_local_addr(&rule.local_addr)
                 .map_err(|reason| ConfigError::InvalidIngress { index: i, reason })?;
+        }
+        for (i, rule) in self.udp_ingress.iter().enumerate() {
+            validate_local_addr(&rule.local_addr)
+                .map_err(|reason| ConfigError::InvalidUdpIngress { index: i, reason })?;
+            if rule.name.is_empty() {
+                return Err(ConfigError::InvalidUdpIngress {
+                    index: i,
+                    reason: "name must not be empty".into(),
+                });
+            }
         }
         Ok(())
     }
@@ -191,6 +216,62 @@ mod tests {
         let cfg = ClientConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.ingress[0].local_addr, "app:8080");
         assert_eq!(cfg.ingress[1].local_addr, "[::1]:8443");
+    }
+
+    #[test]
+    fn parses_udp_ingress_rules() {
+        let toml = r#"
+            server_addr = "tunnel.example.com:4433"
+            server_cert_fingerprint_sha256 = "00000000000000000000000000000000000000000000000000000000000000aa"
+            token = "00000000000000000000000000000000000000000000000000000000000000bb"
+            client_name = "service-a"
+            [[udp_ingress]]
+            name = "wireguard"
+            local_addr = "127.0.0.1:51820"
+        "#;
+        let cfg = ClientConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.udp_ingress.len(), 1);
+        assert_eq!(cfg.udp_ingress[0].name, "wireguard");
+        assert_eq!(cfg.udp_ingress[0].local_addr, "127.0.0.1:51820");
+        // TCP ingress is independent and stays empty.
+        assert!(cfg.ingress.is_empty());
+    }
+
+    #[test]
+    fn rejects_udp_ingress_with_a_bad_local_addr() {
+        let toml = r#"
+            server_addr = "tunnel.example.com:4433"
+            server_cert_fingerprint_sha256 = "00000000000000000000000000000000000000000000000000000000000000aa"
+            token = "00000000000000000000000000000000000000000000000000000000000000bb"
+            client_name = "a"
+            [[udp_ingress]]
+            name = "wg"
+            local_addr = "127.0.0.1"
+        "#;
+        match ClientConfig::from_toml_str(toml).unwrap_err() {
+            ConfigError::InvalidUdpIngress { index, reason } => {
+                assert_eq!(index, 0);
+                assert!(reason.contains("missing"), "got reason: {reason}");
+            }
+            other => panic!("expected InvalidUdpIngress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_udp_ingress_with_an_empty_name() {
+        let toml = r#"
+            server_addr = "tunnel.example.com:4433"
+            server_cert_fingerprint_sha256 = "00000000000000000000000000000000000000000000000000000000000000aa"
+            token = "00000000000000000000000000000000000000000000000000000000000000bb"
+            client_name = "a"
+            [[udp_ingress]]
+            name = ""
+            local_addr = "127.0.0.1:51820"
+        "#;
+        assert!(matches!(
+            ClientConfig::from_toml_str(toml),
+            Err(ConfigError::InvalidUdpIngress { index: 0, .. })
+        ));
     }
 
     #[test]

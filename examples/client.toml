@@ -25,3 +25,10 @@ client_name = "service-a"
 [[ingress]]
 host = "alpha.example.com"
 local_addr = "127.0.0.1:8080"
+
+# UDP ingress: maps each server-side [[udp]] route (by `name`) to the local UDP
+# service to forward it to. Purely client-side, like [[ingress]] above.
+#
+# [[udp_ingress]]
+# name = "wireguard"
+# local_addr = "127.0.0.1:51820"

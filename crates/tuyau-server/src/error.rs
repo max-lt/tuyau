@@ -46,6 +46,21 @@ pub enum ConfigError {
 
     #[error("upstream '{0}' must set exactly one of local_addr / local_socket")]
     UpstreamTarget(String),
+
+    #[error("duplicate udp route name: {0}")]
+    DuplicateUdpRoute(String),
+
+    #[error("udp route name '{0}' must be 1-64 chars of [A-Za-z0-9._-] (it rides every datagram)")]
+    UdpRouteName(String),
+
+    #[error("udp route '{0}' must set exactly one of client / local_addr")]
+    UdpTarget(String),
+
+    #[error("udp route '{0}' listens on listen_addr, which the QUIC tunnel already holds")]
+    UdpPortConflictsWithTunnel(String),
+
+    #[error("duplicate udp listen_addr: {0}")]
+    DuplicateUdpListenAddr(std::net::SocketAddr),
 }
 
 #[derive(Debug, Error)]

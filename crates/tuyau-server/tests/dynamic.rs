@@ -40,6 +40,7 @@ impl RoutingBackend for OneToken {
             client_name: "dyn".into(),
             balance: Balance::RoundRobin,
             hostnames: vec![(self.host.clone(), TlsMode::Passthrough)],
+            ..Default::default()
         })
     }
 }
@@ -58,6 +59,7 @@ fn dyn_cfg(dir: &TempDir) -> ServerConfig {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        udp: vec![],
         upstreams: vec![],
     }
 }
@@ -123,6 +125,7 @@ impl RoutingBackend for TwoTenants {
             client_name: client_name.into(),
             balance: Balance::RoundRobin,
             hostnames: vec![("shop.example".into(), TlsMode::Terminated)],
+            ..Default::default()
         })
     }
 }

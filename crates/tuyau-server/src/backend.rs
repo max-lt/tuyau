@@ -1,14 +1,22 @@
 use async_trait::async_trait;
 use subtle::ConstantTimeEq;
 
-use crate::config::{Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode};
+use crate::config::{Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, UdpEntry};
 
 /// What the core needs to admit a client tunnel: who it is, how to balance
-/// several tunnels of that identity, and which hostnames it serves.
+/// several tunnels of that identity, and what it serves — hostnames on the
+/// public TLS listener, UDP route names on the public UDP listeners.
+///
+/// `Default` is implemented so an embedder can build one with `..Default::
+/// default()` and stay source-compatible as the grant grows.
+#[derive(Debug, Clone, Default)]
 pub struct ClientGrant {
     pub client_name: String,
     pub balance: Balance,
     pub hostnames: Vec<(String, TlsMode)>,
+    /// Names of the `[[udp]]` routes this client serves. Datagrams arriving on
+    /// those ports are forwarded over its tunnel.
+    pub udp_routes: Vec<String>,
 }
 
 /// The core's sole policy input. The server calls [`RoutingBackend::admit`] when
@@ -31,6 +39,7 @@ pub trait RoutingBackend: Send + Sync {
 pub struct StaticBackend {
     clients: Vec<ClientEntry>,
     hostnames: Vec<HostnameEntry>,
+    udp: Vec<UdpEntry>,
 }
 
 impl StaticBackend {
@@ -38,6 +47,7 @@ impl StaticBackend {
         Self {
             clients: cfg.clients.clone(),
             hostnames: cfg.hostnames.clone(),
+            udp: cfg.udp.clone(),
         }
     }
 }
@@ -62,10 +72,18 @@ impl RoutingBackend for StaticBackend {
             .map(|h| (h.host.clone(), h.tls_mode))
             .collect();
 
+        let udp_routes = self
+            .udp
+            .iter()
+            .filter(|u| u.client.as_deref() == Some(client.name.as_str()))
+            .map(|u| u.name.clone())
+            .collect();
+
         Some(ClientGrant {
             client_name: client.name.clone(),
             balance: client.balance,
             hostnames,
+            udp_routes,
         })
     }
 }
@@ -94,6 +112,18 @@ mod tests {
         }
     }
 
+    fn udp(name: &str, client: &str) -> UdpEntry {
+        UdpEntry {
+            name: name.into(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            client: Some(client.into()),
+            local_addr: None,
+            idle_timeout_secs: None,
+            max_sessions: None,
+            amplification_factor: None,
+        }
+    }
+
     fn cfg(clients: Vec<ClientEntry>, hostnames: Vec<HostnameEntry>) -> ServerConfig {
         ServerConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -107,11 +137,46 @@ mod tests {
             max_public_connections: None,
             error_502_file: None,
             upstreams: vec![],
+            udp: vec![],
         }
     }
 
     fn backend(clients: Vec<ClientEntry>, hostnames: Vec<HostnameEntry>) -> StaticBackend {
         StaticBackend::new(&cfg(clients, hostnames))
+    }
+
+    #[tokio::test]
+    async fn udp_routes_are_filtered_to_the_owning_client() {
+        let mut c = cfg(
+            vec![
+                client("a", TOK_A, Balance::LastWriteWins),
+                client("b", TOK_B, Balance::LastWriteWins),
+            ],
+            vec![],
+        );
+        // A local-upstream route belongs to no client and must never be granted.
+        c.udp = vec![
+            udp("wg", "a"),
+            udp("dns", "b"),
+            udp("games", "a"),
+            UdpEntry {
+                name: "local-only".into(),
+                client: None,
+                local_addr: Some("127.0.0.1:53".parse().unwrap()),
+                ..udp("local-only", "a")
+            },
+        ];
+        let b = StaticBackend::new(&c);
+
+        let grant = b.admit(&TOK_A).await.unwrap();
+        assert_eq!(
+            grant.udp_routes,
+            vec!["wg".to_string(), "games".to_string()]
+        );
+        assert_eq!(
+            b.admit(&TOK_B).await.unwrap().udp_routes,
+            vec!["dns".to_string()]
+        );
     }
 
     #[tokio::test]

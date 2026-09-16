@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "embedded-passthrough".into()),
         ingress: vec![], // we serve directly, not forwarding to a local port
+        udp_ingress: vec![],
     };
 
     let tunnel = TunnelClient::connect(cfg).await?;

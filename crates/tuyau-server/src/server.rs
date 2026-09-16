@@ -27,6 +27,7 @@ use crate::control::{Control, TunnelInfo};
 use crate::error::ServerError;
 use crate::public;
 use crate::routes::RoutingTable;
+use crate::udp::{self, UdpRouter};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 // Tunnel liveness. A silently-dead tunnel (killed process, severed network) is
@@ -58,6 +59,8 @@ pub struct TunnelServer {
     cancel: CancellationToken,
     accept_handle: JoinHandle<()>,
     public_handle: Option<JoinHandle<()>>,
+    /// One per configured `[[udp]]` route. Empty for a TCP-only deployment.
+    udp_handles: Vec<udp::UdpListenerHandle>,
     // The dynamic-ACME controller (when ACME is active). Its tasks are tied to
     // `cancel`, so shutdown stops them without an explicit await.
     #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
@@ -185,11 +188,27 @@ impl TunnelServer {
             None => (None, None, None),
         };
 
+        // Public UDP routes, each on its own port. The router is shared by the
+        // listeners (forward path) and by every tunnel's datagram pump (return
+        // path), so it is created even when no listener binds yet.
+        let udp_router = UdpRouter::new();
+        let udp_handles = udp::start_all(
+            &config.udp,
+            routes.clone(),
+            udp_router.clone(),
+            cancel.clone(),
+        )
+        .await?;
+        // Only tunnels get a datagram pump, and only when UDP routes exist at
+        // all — a TCP-only server never spawns one.
+        let udp_router = (!config.udp.is_empty()).then_some(udp_router);
+
         let control = Control::new();
         let endpoint_clone = endpoint.clone();
         let routes_clone = routes.clone();
         let control_clone = control.clone();
         let cancel_clone = cancel.clone();
+        let udp_router_clone = udp_router.clone();
 
         let accept_handle = tokio::spawn(async move {
             accept_loop(
@@ -197,6 +216,7 @@ impl TunnelServer {
                 backend,
                 routes_clone,
                 control_clone,
+                udp_router_clone,
                 cancel_clone,
             )
             .await;
@@ -211,6 +231,7 @@ impl TunnelServer {
             cancel,
             accept_handle,
             public_handle,
+            udp_handles,
             acme,
         })
     }
@@ -225,6 +246,15 @@ impl TunnelServer {
         self.public_addr
     }
 
+    /// Address a configured `[[udp]]` route is bound to, by route name.
+    /// `None` if no such route exists. Useful when the config asked for port 0.
+    pub fn udp_local_addr(&self, route: &str) -> Option<SocketAddr> {
+        self.udp_handles
+            .iter()
+            .find(|h| h.name == route)
+            .map(|h| h.local_addr)
+    }
+
     pub fn cert_fingerprint(&self) -> [u8; 32] {
         self.fingerprint
     }
@@ -233,6 +263,12 @@ impl TunnelServer {
     /// while its owning client tunnel is connected).
     pub fn active_hostnames(&self) -> Vec<String> {
         self.routes.active_hostnames()
+    }
+
+    /// Sorted snapshot of UDP routes whose owning client tunnel is connected.
+    /// Routes pointed at a local address are not listed — they have no tunnel.
+    pub fn active_udp_routes(&self) -> Vec<String> {
+        self.routes.active_udp_routes()
     }
 
     /// Liveness for a process watchdog: `false` if an accept loop has stopped
@@ -244,10 +280,16 @@ impl TunnelServer {
         if self.accept_handle.is_finished() {
             return false;
         }
-        !self
+        if self
             .public_handle
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return false;
+        }
+        // A dead UDP receive loop is just as silent a failure as a dead TCP
+        // accept loop: the port stays bound and every datagram is lost.
+        !self.udp_handles.iter().any(|h| h.join.is_finished())
     }
 
     /// Snapshot of currently connected tunnels (metadata only). Behind the
@@ -304,6 +346,9 @@ impl TunnelServer {
         let _ = self.accept_handle.await;
         if let Some(h) = self.public_handle {
             let _ = h.await;
+        }
+        for h in self.udp_handles {
+            let _ = h.join.await;
         }
         // ACME tasks are tied to `cancel` (already cancelled above) — they self-
         // terminate; nothing to await.
@@ -534,6 +579,7 @@ async fn accept_loop(
     backend: Arc<dyn RoutingBackend>,
     routes: RoutingTable,
     control: Control,
+    udp_router: Option<Arc<UdpRouter>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -550,9 +596,11 @@ async fn accept_loop(
                 let backend = Arc::clone(&backend);
                 let routes = routes.clone();
                 let control = control.clone();
+                let udp_router = udp_router.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_incoming(incoming, backend, routes, control, cancel).await
+                    if let Err(e) =
+                        handle_incoming(incoming, backend, routes, control, udp_router, cancel).await
                     {
                         tracing::warn!(error = %e, "connection handler error");
                     }
@@ -575,6 +623,7 @@ async fn handle_incoming(
     backend: Arc<dyn RoutingBackend>,
     routes: RoutingTable,
     control: Control,
+    udp_router: Option<Arc<UdpRouter>>,
     cancel: CancellationToken,
 ) -> Result<(), ServerError> {
     let connection = incoming.await?;
@@ -620,6 +669,7 @@ async fn handle_incoming(
 
                     for prev in routes.install(
                         grant.hostnames.clone(),
+                        &grant.udp_routes,
                         &grant.client_name,
                         grant.balance,
                         &connection,
@@ -633,8 +683,29 @@ async fn handle_incoming(
                         name = %grant.client_name,
                         client_name = %hello.client_name,
                         hosts = ?host_list,
+                        udp_routes = ?grant.udp_routes,
                         "client connected"
                     );
+
+                    // Return path for this tunnel's UDP sessions. Started
+                    // before the welcome so a datagram can't arrive before
+                    // anything is reading them.
+                    if !grant.udp_routes.is_empty()
+                        && let Some(router) = &udp_router
+                    {
+                        if connection.max_datagram_size().is_none() {
+                            tracing::warn!(
+                                peer = %peer,
+                                name = %grant.client_name,
+                                "client serves udp routes but does not support QUIC datagrams; udp traffic will be dropped"
+                            );
+                        }
+                        udp::spawn_tunnel_pump(
+                            connection.clone(),
+                            router.clone(),
+                            cancel.child_token(),
+                        );
+                    }
 
                     match writer.send(HelloResponse::Welcome).await {
                         Ok(()) => {

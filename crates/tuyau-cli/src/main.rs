@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use tuyau_client::{ClientConfig, IngressRule, TunnelClient};
+use tuyau_client::{ClientConfig, IngressRule, TunnelClient, UdpIngressRule};
 use tuyau_server::{ServerConfig, TunnelServer};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -35,7 +35,7 @@ enum Cmd {
 #[derive(clap::Args, Debug)]
 struct ClientArgs {
     /// Path to client.toml. Mutually exclusive with the per-field flags.
-    #[arg(long, conflicts_with_all = ["server", "fingerprint", "token_file", "name", "ingress"])]
+    #[arg(long, conflicts_with_all = ["server", "fingerprint", "token_file", "name", "ingress", "udp_ingress"])]
     config: Option<PathBuf>,
 
     /// host:port of the tuyau-server. Env: TUYAU_SERVER.
@@ -62,6 +62,12 @@ struct ClientArgs {
     /// `[[ingress]]` for long lists.
     #[arg(long = "ingress", value_name = "HOST=LOCAL_ADDR")]
     ingress: Vec<String>,
+
+    /// UDP ingress rule `name=local_addr`, repeatable. Maps a server-side
+    /// `[[udp]]` route name to the local UDP `host:port` to forward it to. No
+    /// env equivalent — use TOML `[[udp_ingress]]` for long lists.
+    #[arg(long = "udp-ingress", value_name = "NAME=LOCAL_ADDR")]
+    udp_ingress: Vec<String>,
 }
 
 #[tokio::main]
@@ -182,6 +188,7 @@ fn build_client_config_inner(
     let client_name = args.name.or(env.name).unwrap_or_else(default_name);
 
     let ingress = parse_ingress(&args.ingress)?;
+    let udp_ingress = parse_udp_ingress(&args.udp_ingress)?;
 
     let cfg = ClientConfig {
         server_addr,
@@ -189,6 +196,7 @@ fn build_client_config_inner(
         token,
         client_name,
         ingress,
+        udp_ingress,
     };
     cfg.validate()
         .map_err(|e| anyhow!("invalid client config: {e}"))?;
@@ -212,6 +220,28 @@ fn parse_ingress(entries: &[String]) -> Result<Vec<IngressRule>> {
             }
             Ok(IngressRule {
                 host: host.to_string(),
+                local_addr: local_addr.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_udp_ingress(entries: &[String]) -> Result<Vec<UdpIngressRule>> {
+    // Same split-then-validate-centrally shape as `parse_ingress`, so the TOML
+    // and CLI paths surface identical error messages.
+    entries
+        .iter()
+        .map(|e| {
+            let (name, local_addr) = e
+                .split_once('=')
+                .ok_or_else(|| anyhow!("invalid --udp-ingress '{e}': expected NAME=LOCAL_ADDR"))?;
+            if name.is_empty() || local_addr.is_empty() {
+                return Err(anyhow!(
+                    "invalid --udp-ingress '{e}': NAME and LOCAL_ADDR must both be non-empty"
+                ));
+            }
+            Ok(UdpIngressRule {
+                name: name.to_string(),
                 local_addr: local_addr.to_string(),
             })
         })
@@ -286,6 +316,7 @@ mod tests {
             token_file: None,
             name: None,
             ingress: vec![],
+            udp_ingress: vec![],
         }
     }
 
@@ -342,6 +373,7 @@ mod tests {
             token_file: Some(tok.path().to_path_buf()),
             name: Some("explicit".into()),
             ingress: vec![],
+            udp_ingress: vec![],
         };
         let cfg = build_client_config_inner(args, EnvVars::default(), stub_default_name).unwrap();
 
@@ -380,6 +412,7 @@ mod tests {
             token_file: None,
             name: Some("flag-name".into()),
             ingress: vec![],
+            udp_ingress: vec![],
         };
         let env = EnvVars {
             server: Some("env:9999".into()),
@@ -501,6 +534,59 @@ mod tests {
     }
 
     #[test]
+    fn parse_udp_ingress_single_and_multiple() {
+        let rules = parse_udp_ingress(&[
+            "wg=127.0.0.1:51820".to_string(),
+            "dns=10.0.0.53:53".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].name, "wg");
+        assert_eq!(rules[0].local_addr, "127.0.0.1:51820");
+        assert_eq!(rules[1].name, "dns");
+    }
+
+    #[test]
+    fn parse_udp_ingress_rejects_bad_shapes() {
+        assert!(parse_udp_ingress(&["wg".to_string()]).is_err());
+        assert!(parse_udp_ingress(&["=127.0.0.1:51820".to_string()]).is_err());
+        assert!(parse_udp_ingress(&["wg=".to_string()]).is_err());
+    }
+
+    #[test]
+    fn builds_udp_ingress_from_flags() {
+        let mut tok = NamedTempFile::new().unwrap();
+        writeln!(tok, "{}", HEX_B).unwrap();
+
+        let args = ClientArgs {
+            config: None,
+            server: Some("host:4433".into()),
+            fingerprint: Some(HEX_A.into()),
+            token_file: Some(tok.path().to_path_buf()),
+            name: None,
+            ingress: vec![],
+            udp_ingress: vec!["wg=127.0.0.1:51820".to_string()],
+        };
+        let cfg = build_client_config_inner(args, EnvVars::default(), stub_default_name).unwrap();
+        assert_eq!(cfg.udp_ingress.len(), 1);
+        assert_eq!(cfg.udp_ingress[0].name, "wg");
+        assert_eq!(cfg.udp_ingress[0].local_addr, "127.0.0.1:51820");
+    }
+
+    #[test]
+    fn clap_rejects_config_combined_with_udp_ingress() {
+        let result = Cli::try_parse_from([
+            "tuyau",
+            "client",
+            "--config",
+            "/x.toml",
+            "--udp-ingress",
+            "wg=127.0.0.1:51820",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn builds_ingress_from_flags() {
         let mut tok = NamedTempFile::new().unwrap();
         writeln!(tok, "{}", HEX_B).unwrap();
@@ -512,6 +598,7 @@ mod tests {
             token_file: Some(tok.path().to_path_buf()),
             name: None,
             ingress: vec!["alpha.example.com=127.0.0.1:8080".to_string()],
+            udp_ingress: vec![],
         };
         let cfg = build_client_config_inner(args, EnvVars::default(), stub_default_name).unwrap();
         assert_eq!(cfg.ingress.len(), 1);
