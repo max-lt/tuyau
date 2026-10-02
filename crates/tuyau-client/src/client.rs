@@ -76,7 +76,14 @@ impl TunnelClient {
         ));
         quinn_config.transport_config(Arc::new(transport));
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("0.0.0.0:0 parses"))?;
+        // Bind the UDP socket in the same address family as the resolved
+        // server address — a 0.0.0.0 (IPv4) socket cannot dial an IPv6 server.
+        let bind_addr = if server_addr.is_ipv6() {
+            "[::]:0".parse().expect("[::]:0 parses")
+        } else {
+            "0.0.0.0:0".parse().expect("0.0.0.0:0 parses")
+        };
+        let mut endpoint = Endpoint::client(bind_addr)?;
         endpoint.set_default_client_config(quinn_config);
 
         tracing::info!(server_addr = %server_addr, host = %host, "connecting");
