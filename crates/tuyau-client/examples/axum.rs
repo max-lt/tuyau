@@ -13,10 +13,16 @@
 //!   TUYAU_TOKEN=<64 hex>
 
 use std::env;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use axum::response::Html;
 use axum::{Router, routing::get};
 use tuyau_client::{ClientConfig, TunnelClient};
+
+/// Path to the HTML page, re-read on every request so edits show up on a plain
+/// browser refresh — no rebuild. Override with `TUYAU_PAGE`.
+const DEFAULT_PAGE: &str = "crates/tuyau-client/examples/page.html";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,8 +46,24 @@ async fn main() -> Result<()> {
     let listener = tunnel.listener();
     let shutdown = listener.closed();
 
+    let page_path = Arc::new(env::var("TUYAU_PAGE").unwrap_or_else(|_| DEFAULT_PAGE.into()));
+
     let app = Router::new()
-        .route("/", get(|| async { "hello from axum-over-tuyau" }))
+        .route(
+            "/",
+            get({
+                let page_path = Arc::clone(&page_path);
+                move || {
+                    let page_path = Arc::clone(&page_path);
+                    async move {
+                        match tokio::fs::read_to_string(page_path.as_str()).await {
+                            Ok(html) => Html(html),
+                            Err(e) => Html(format!("<h1>page load error</h1><pre>{e}</pre>")),
+                        }
+                    }
+                }
+            }),
+        )
         .route("/health", get(|| async { "ok" }));
 
     axum::serve(listener, app)

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hello from Maxime's MacBook Air</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    min-height: 100vh; display: grid; place-items: center;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    background: radial-gradient(120% 120% at 50% 0%, #1e293b 0%, #0b1120 55%, #05080f 100%);
+    color: #e6edf3;
+  }
+  .card {
+    text-align: center; padding: 3.5rem 3rem; border-radius: 22px;
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 30px 80px -20px rgba(0,0,0,0.6);
+    backdrop-filter: blur(12px);
+    max-width: 30rem;
+  }
+  .laptop { font-size: 3.5rem; line-height: 1; }
+  h1 { font-size: 1.9rem; font-weight: 600; letter-spacing: -0.02em; margin: 1.2rem 0 0.4rem; }
+  .grad { background: linear-gradient(90deg,#38bdf8,#818cf8,#c084fc);
+          -webkit-background-clip: text; background-clip: text; color: transparent; }
+  p { color: #9aa7b8; line-height: 1.6; font-size: 0.98rem; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 0.45rem; margin-top: 1.8rem;
+    padding: 0.5rem 1rem; border-radius: 999px; font-size: 0.82rem;
+    background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.25); color: #7dd3fc;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399;
+         box-shadow: 0 0 0 0 rgba(52,211,153,0.7); animation: pulse 2s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(52,211,153,0.6); }
+    70% { box-shadow: 0 0 0 7px rgba(52,211,153,0); }
+    100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
+  }
+  code { font-family: ui-monospace, "SF Mono", monospace; color: #c4b5fd; }
+  a.tuyau { color: #c4b5fd; text-decoration: none; border-bottom: 1px solid rgba(196,181,253,0.4);
+            transition: color 0.15s, border-color 0.15s; }
+  a.tuyau:hover { color: #e9d5ff; border-bottom-color: #e9d5ff; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="laptop">💻</div>
+    <h1>Hello from <span class="grad">Maxime's MacBook Air</span></h1>
+    <p>This page is served straight off a laptop &mdash; no public IP, no open ports &mdash;
+       tunneled to you over QUIC by <a class="tuyau" href="https://tuyau.brumal.dev"><code>tuyau</code></a>.</p>
+    <div class="pill"><span class="dot"></span> live through the tunnel</div>
+  </div>
+</body>
+</html>
