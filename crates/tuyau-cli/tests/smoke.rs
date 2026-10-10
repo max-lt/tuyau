@@ -33,6 +33,8 @@ async fn end_to_end_handshake() {
             host: "alpha.example.com".into(),
             client: "service-a".into(),
             tls_mode: TlsMode::Terminated,
+            tls_cert_file: None,
+            tls_key_file: None,
         }],
     };
 

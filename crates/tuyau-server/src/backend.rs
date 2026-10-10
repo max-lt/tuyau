@@ -91,6 +91,8 @@ mod tests {
             host: h.into(),
             client: client.into(),
             tls_mode: mode,
+            tls_cert_file: None,
+            tls_key_file: None,
         }
     }
 

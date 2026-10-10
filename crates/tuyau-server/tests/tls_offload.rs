@@ -107,6 +107,8 @@ async fn tls_offload_pipes_plaintext_to_cleartext_backend() {
             local_addr: Some(backend),
             local_socket: None,
             tls_mode: TlsMode::TlsOffload,
+            tls_cert_file: None,
+            tls_key_file: None,
         }],
         max_public_connections: None,
         error_502_file: None,

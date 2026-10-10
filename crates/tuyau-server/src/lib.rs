@@ -6,6 +6,7 @@ mod config;
 mod control;
 mod error;
 mod h2proxy;
+mod host_certs;
 mod public;
 mod routes;
 mod server;

@@ -25,9 +25,10 @@ pub struct ServerConfig {
     pub acme: Option<AcmeSection>,
     /// Optional path to a PEM certificate chain (leaf first) for the public
     /// listener. When set — and `acme` is not — the listener serves this cert
-    /// for all terminated hostnames instead of a self-signed one. Useful for a
-    /// cert obtained out-of-band (e.g. Let's Encrypt via DNS-01) when inbound
-    /// TLS-ALPN-01 validation isn't possible. Requires `tls_key_file` too.
+    /// for the terminated hostnames without a cert of their own, instead of a
+    /// self-signed one. Useful for a cert obtained out-of-band (e.g. Let's
+    /// Encrypt via DNS-01) when inbound TLS-ALPN-01 validation isn't possible.
+    /// Requires `tls_key_file` too.
     #[serde(default)]
     pub tls_cert_file: Option<PathBuf>,
     /// Private key (PEM) matching `tls_cert_file`.
@@ -100,6 +101,12 @@ pub struct HostnameEntry {
     pub client: String,
     #[serde(default)]
     pub tls_mode: TlsMode,
+    /// Optional cert of this hostname, served instead of the server-wide one
+    /// (`acme`, `tls_cert_file` or self-signed). Terminating modes only.
+    #[serde(default)]
+    pub tls_cert_file: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key_file: Option<PathBuf>,
 }
 
 /// A static local upstream: a hostname served by forwarding to a local address
@@ -129,6 +136,11 @@ pub struct UpstreamEntry {
     pub local_socket: Option<PathBuf>,
     #[serde(default)]
     pub tls_mode: TlsMode,
+    /// Optional cert of this hostname, as in [`HostnameEntry`].
+    #[serde(default)]
+    pub tls_cert_file: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key_file: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -167,6 +179,7 @@ impl ServerConfig {
             }
         }
         self.validate_upstream_targets()?;
+        self.validate_host_certs()?;
 
         let known_clients: HashSet<&str> = self.clients.iter().map(|c| c.name.as_str()).collect();
         for h in &self.hostnames {
@@ -195,6 +208,7 @@ impl ServerConfig {
             }
         }
         self.validate_upstream_targets()?;
+        self.validate_host_certs()?;
         self.validate_acme()
     }
 
@@ -206,6 +220,46 @@ impl ServerConfig {
                 return Err(ConfigError::UpstreamTarget(u.host.clone()));
             }
         }
+        Ok(())
+    }
+
+    /// The (host, mode, cert, key) of each hostname and upstream entry.
+    pub(crate) fn host_certs(
+        &self,
+    ) -> impl Iterator<Item = (&str, TlsMode, &Option<PathBuf>, &Option<PathBuf>)> {
+        let hostnames = self.hostnames.iter().map(|h| {
+            (
+                h.host.as_str(),
+                h.tls_mode,
+                &h.tls_cert_file,
+                &h.tls_key_file,
+            )
+        });
+        let upstreams = self.upstreams.iter().map(|u| {
+            (
+                u.host.as_str(),
+                u.tls_mode,
+                &u.tls_cert_file,
+                &u.tls_key_file,
+            )
+        });
+
+        hostnames.chain(upstreams)
+    }
+
+    /// A cert of an entry comes with its key, and only in a mode where the
+    /// server terminates TLS: a passthrough host never uses a cert here.
+    fn validate_host_certs(&self) -> Result<(), ConfigError> {
+        for (host, mode, cert, key) in self.host_certs() {
+            if cert.is_some() != key.is_some() {
+                return Err(ConfigError::HostCertPair(host.to_string()));
+            }
+
+            if cert.is_some() && mode == TlsMode::Passthrough {
+                return Err(ConfigError::HostCertPassthrough(host.to_string()));
+            }
+        }
+
         Ok(())
     }
 
@@ -427,6 +481,55 @@ mod tests {
             Err(ConfigError::AcmeContact(c)) => assert_eq!(c, "ops@example.com"),
             other => panic!("expected AcmeContact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_host_cert_needs_its_key_and_a_terminating_mode() {
+        let upstream = |extra: &str| {
+            let toml = format!(
+                "listen_addr = \"0.0.0.0:4433\"\nclients = []\n\
+                 [[upstreams]]\nhost = \"a.example.com\"\nlocal_addr = \"127.0.0.1:1\"\n{extra}"
+            );
+            ServerConfig::from_toml_str(&toml).unwrap().validate()
+        };
+
+        let pair = "tls_cert_file = \"a.crt\"\ntls_key_file = \"a.key\"\n";
+
+        assert!(upstream(pair).is_ok());
+        assert!(upstream(&format!("tls_mode = \"tls_offload\"\n{pair}")).is_ok());
+        assert!(matches!(
+            upstream("tls_cert_file = \"a.crt\"\n"),
+            Err(ConfigError::HostCertPair(host)) if host == "a.example.com"
+        ));
+        assert!(matches!(
+            upstream("tls_key_file = \"a.key\"\n"),
+            Err(ConfigError::HostCertPair(_))
+        ));
+        assert!(matches!(
+            upstream(&format!("tls_mode = \"passthrough\"\n{pair}")),
+            Err(ConfigError::HostCertPassthrough(_))
+        ));
+    }
+
+    #[test]
+    fn a_hostname_entry_takes_a_cert_too() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:4433"
+            [[clients]]
+            name = "a"
+            token = "0000000000000000000000000000000000000000000000000000000000000001"
+            [[hostnames]]
+            host = "a.example.com"
+            client = "a"
+            tls_cert_file = "a.crt"
+        "#;
+
+        let config = ServerConfig::from_toml_str(toml).unwrap();
+
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::HostCertPair(_))
+        ));
     }
 
     #[test]

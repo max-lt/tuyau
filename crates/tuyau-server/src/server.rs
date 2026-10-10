@@ -25,6 +25,7 @@ use crate::cert::{self, CertMaterial};
 use crate::config::{AcmeSection, ServerConfig, TlsMode};
 use crate::control::{Control, TunnelInfo};
 use crate::error::ServerError;
+use crate::host_certs::HostCerts;
 use crate::public;
 use crate::routes::RoutingTable;
 
@@ -121,18 +122,16 @@ impl TunnelServer {
                 // `terminated` (HTTP) and `tls_offload` hold a cert here.
                 let terminates =
                     |m: TlsMode| matches!(m, TlsMode::Terminated | TlsMode::TlsOffload);
+                let host_certs = HostCerts::load(&config)?;
                 let terminated_hostnames: Vec<String> = config
-                    .hostnames
+                    .host_certs()
+                    .filter(|(_, mode, _, _)| terminates(*mode))
+                    .map(|(host, _, _, _)| host.to_string())
+                    .collect();
+                let shared_hostnames: Vec<String> = terminated_hostnames
                     .iter()
-                    .filter(|h| terminates(h.tls_mode))
-                    .map(|h| h.host.clone())
-                    .chain(
-                        config
-                            .upstreams
-                            .iter()
-                            .filter(|u| terminates(u.tls_mode))
-                            .map(|u| u.host.clone()),
-                    )
+                    .filter(|host| !host_certs.covers(host))
+                    .cloned()
                     .collect();
 
                 let (resolver, acme) = build_cert_resolver(
@@ -140,9 +139,11 @@ impl TunnelServer {
                     &config.tls_cert_file,
                     &config.tls_key_file,
                     &terminated_hostnames,
+                    &shared_hostnames,
                     &cert_dir,
                     cancel.clone(),
                 )?;
+                let resolver = host_certs.resolver(resolver);
                 let acme_active = acme.is_some();
 
                 let max_conns = config
@@ -318,12 +319,15 @@ type ResolverBundle = (Arc<dyn ResolvesServerCert>, Option<AcmeController>);
 /// Build the cert resolver the public listener should use: rustls-acme's
 /// dynamic resolver if `[acme]` is configured (with a background renewal
 /// task), or a static resolver over a fresh self-signed multi-SAN cert
-/// otherwise.
+/// otherwise. `terminated_hostnames` are all the terminated config hosts;
+/// `shared_hostnames` are those without a cert of their own, the only ones
+/// the server-wide cert covers.
 fn build_cert_resolver(
     acme: &Option<AcmeSection>,
     tls_cert_file: &Option<std::path::PathBuf>,
     tls_key_file: &Option<std::path::PathBuf>,
     terminated_hostnames: &[String],
+    shared_hostnames: &[String],
     cert_dir: &std::path::Path,
     cancel: CancellationToken,
 ) -> Result<ResolverBundle, ServerError> {
@@ -337,7 +341,13 @@ fn build_cert_resolver(
             // dynamic ones (provisioned via the seam) each get their own per-domain
             // cert added to the MultiResolver — so adding one never disturbs the
             // existing certs.
-            let static_resolver = build_acme_state(acme_cfg, terminated_hostnames, cancel.clone())?;
+            // When each config host has its own cert, nothing needs a combined
+            // ACME cert, but the controller still serves provisioned hosts
+            let static_resolver = if shared_hostnames.is_empty() {
+                build_static_resolver(cert::generate_public_cert(&[], cert_dir)?)?
+            } else {
+                build_acme_state(acme_cfg, shared_hostnames, cancel.clone())?
+            };
             let multi = Arc::new(MultiResolver {
                 static_resolver,
                 dynamic: RwLock::new(HashMap::new()),
@@ -366,7 +376,7 @@ fn build_cert_resolver(
         );
         return Ok((build_static_chain_resolver(chain, key)?, None));
     }
-    let public_cert = cert::generate_public_cert(terminated_hostnames, cert_dir)?;
+    let public_cert = cert::generate_public_cert(shared_hostnames, cert_dir)?;
     Ok((build_static_resolver(public_cert)?, None))
 }
 
@@ -743,4 +753,39 @@ async fn handle_incoming(
     routes.remove_conn(stable_id);
     control.unregister(stable_id);
     Ok(())
+}
+
+#[cfg(all(test, feature = "dynamic"))]
+mod tests {
+    use super::*;
+
+    /// No ACME order starts here: a test that issues one would reach Let's Encrypt.
+    #[tokio::test]
+    async fn a_host_with_its_own_cert_never_gets_an_acme_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let acme = Some(AcmeSection {
+            contact: "mailto:ops@example.com".into(),
+            cache_dir: dir.path().join("acme"),
+            production: false,
+        });
+        let own = vec!["own.example.com".to_string()];
+
+        let (_, controller) = build_cert_resolver(
+            &acme,
+            &None,
+            &None,
+            &own,
+            &[],
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+
+        let controller = controller.expect("hosts provisioned later still need ACME");
+
+        controller.ensure(&["OWN.example.com".to_string()]);
+
+        assert!(controller.added.lock().is_empty());
+        assert!(controller.multi.dynamic.read().is_empty());
+    }
 }

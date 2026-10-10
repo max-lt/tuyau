@@ -28,6 +28,8 @@ async fn public_connection_cap_sheds_excess() {
             local_addr: Some("127.0.0.1:9".parse().unwrap()),
             local_socket: None,
             tls_mode: TlsMode::Passthrough,
+            tls_cert_file: None,
+            tls_key_file: None,
         }],
         max_public_connections: Some(1),
         error_502_file: None,

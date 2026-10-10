@@ -46,6 +46,12 @@ pub enum ConfigError {
 
     #[error("upstream '{0}' must set exactly one of local_addr / local_socket")]
     UpstreamTarget(String),
+
+    #[error("'{0}' must set both tls_cert_file and tls_key_file, or neither")]
+    HostCertPair(String),
+
+    #[error("'{0}' sets a cert in passthrough mode, where the server holds no cert")]
+    HostCertPassthrough(String),
 }
 
 #[derive(Debug, Error)]

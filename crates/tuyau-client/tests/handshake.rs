@@ -40,6 +40,8 @@ fn host_entry(host: &str, tls_mode: TlsMode) -> HostnameEntry {
         host: host.into(),
         client: "service-a".into(),
         tls_mode,
+        tls_cert_file: None,
+        tls_key_file: None,
     }
 }
 

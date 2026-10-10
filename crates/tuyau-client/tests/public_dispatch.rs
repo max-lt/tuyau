@@ -137,6 +137,8 @@ async fn public_tls_dispatches_bytes_through_tunnel() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -185,6 +187,8 @@ async fn public_tls_with_unknown_sni_is_dropped() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -292,6 +296,8 @@ async fn public_tls_passthrough_forwards_raw_tls() {
         host: "secure.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Passthrough,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -353,6 +359,8 @@ async fn local_upstream_passthrough_forwards_to_local_service() {
             local_addr: Some(local_addr),
             local_socket: None,
             tls_mode: TlsMode::Passthrough,
+            tls_cert_file: None,
+            tls_key_file: None,
         }],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
@@ -439,6 +447,8 @@ async fn local_upstream_unix_socket_terminated_forwards_to_service() {
             local_addr: None,
             local_socket: Some(sock),
             tls_mode: TlsMode::Terminated,
+            tls_cert_file: None,
+            tls_key_file: None,
         }],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
@@ -510,6 +520,8 @@ async fn end_to_end_http_request_through_tunnel() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -568,6 +580,8 @@ async fn tunnel_listener_yields_connection_with_metadata() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -619,6 +633,8 @@ async fn axum_serves_through_tunnel_listener() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -693,6 +709,8 @@ async fn serve_handles_multiple_sequential_requests() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -735,6 +753,8 @@ async fn serve_handles_concurrent_public_connections() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 
@@ -811,11 +831,15 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
                 host: "alpha.example.com".into(),
                 client: "alpha-srv".into(),
                 tls_mode: TlsMode::Terminated,
+                tls_cert_file: None,
+                tls_key_file: None,
             },
             HostnameEntry {
                 host: "beta.example.com".into(),
                 client: "beta-srv".into(),
                 tls_mode: TlsMode::Terminated,
+                tls_cert_file: None,
+                tls_key_file: None,
             },
         ],
     };
@@ -900,6 +924,8 @@ async fn round_robin_spreads_public_connections_across_tunnels() {
             host: "alpha.example.com".into(),
             client: "service-a".into(),
             tls_mode: TlsMode::Terminated,
+            tls_cert_file: None,
+            tls_key_file: None,
         }],
     };
     let server = TunnelServer::start(server_cfg).await.unwrap();
@@ -945,6 +971,8 @@ async fn large_payload_roundtrips_through_tunnel() {
         host: "alpha.example.com".into(),
         client: "service-a".into(),
         tls_mode: TlsMode::Terminated,
+        tls_cert_file: None,
+        tls_key_file: None,
     }])
     .await;
 

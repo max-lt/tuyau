@@ -85,3 +85,14 @@ tls_mode = "passthrough"
 #
 # tls_cert_file = "/etc/letsencrypt/live/alpha.example.com/fullchain.pem"
 # tls_key_file  = "/etc/letsencrypt/live/alpha.example.com/privkey.pem"
+#
+# A [[hostnames]] or [[upstreams]] entry can set its own cert with the same two
+# keys, e.g. one Cloudflare origin cert per zone. The server serves it for that
+# host, and the cert above (or ACME, or self-signed) for the other hosts.
+# Terminated and tls_offload modes only.
+#
+# [[upstreams]]
+# host = "vault.example.org"
+# local_addr = "127.0.0.1:18880"
+# tls_cert_file = "/etc/tuyau/example.org.pem"
+# tls_key_file  = "/etc/tuyau/example.org.key"

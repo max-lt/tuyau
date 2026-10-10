@@ -56,6 +56,9 @@ a local service.
   held by another service, or inbound IPv6 is unreliable for the CA's
   validation), set `tls_cert_file` / `tls_key_file` to serve a cert obtained
   out-of-band — e.g. Let's Encrypt via DNS-01. No inbound validation needed.
+  A `[[hostnames]]` or `[[upstreams]]` entry can set the same two keys to
+  serve its own cert, e.g. one origin cert per zone; the other hostnames keep
+  the server-wide cert.
 - **Custom 502 page**: when a terminated hostname has no live tunnel, the
   server answers with a proper 502 page instead of dropping the connection
   — overridable per deployment via `error_502_file`.
