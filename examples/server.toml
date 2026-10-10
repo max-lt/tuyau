@@ -100,6 +100,13 @@ tls_mode = "passthrough"
 # host, and the cert above (or ACME, or self-signed) for the other hosts.
 # Terminated and tls_offload modes only.
 #
+# Behind a proxy that authenticates to the origin with a client cert (e.g.
+# Cloudflare Authenticated Origin Pulls), accept only clients with a cert
+# signed by that CA on the hosts tuyau terminates. Passthrough hosts are not
+# checked: their backend does the handshake.
+#
+# client_ca_file = "/etc/tuyau/origin-pull-ca.pem"
+#
 # [[upstreams]]
 # host = "vault.example.org"
 # local_addr = "127.0.0.1:18880"

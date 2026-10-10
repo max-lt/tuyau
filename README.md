@@ -60,6 +60,9 @@ a local service.
   A `[[hostnames]]` or `[[upstreams]]` entry can set the same two keys to
   serve its own cert, e.g. one origin cert per zone; the other hostnames keep
   the server-wide cert.
+- **Client cert check**: `client_ca_file` makes the hosts tuyau terminates
+  accept only clients with a cert signed by that CA, e.g. Cloudflare
+  Authenticated Origin Pulls, so nobody bypasses the proxy.
 - **Custom 502 page**: when a terminated hostname has no live tunnel, the
   server answers with a proper 502 page instead of dropping the connection
   — overridable per deployment via `error_502_file`.

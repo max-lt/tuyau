@@ -108,6 +108,7 @@ mod tests {
             tls_key_file: None,
             max_public_connections: None,
             error_502_file: None,
+            client_ca_file: None,
             upstreams: vec![],
         }
     }

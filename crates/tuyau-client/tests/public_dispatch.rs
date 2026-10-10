@@ -38,6 +38,7 @@ async fn spin_up_with_public(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        client_ca_file: None,
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
@@ -352,6 +353,7 @@ async fn local_upstream_passthrough_forwards_to_local_service() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        client_ca_file: None,
         clients: vec![], // front-only: no tunnel clients
         hostnames: vec![],
         upstreams: vec![UpstreamEntry {
@@ -440,6 +442,7 @@ async fn local_upstream_unix_socket_terminated_forwards_to_service() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        client_ca_file: None,
         clients: vec![],
         hostnames: vec![],
         upstreams: vec![UpstreamEntry {
@@ -813,6 +816,7 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        client_ca_file: None,
         upstreams: vec![],
         clients: vec![
             ClientEntry {
@@ -914,6 +918,7 @@ async fn round_robin_spreads_public_connections_across_tunnels() {
         tls_key_file: None,
         max_public_connections: None,
         error_502_file: None,
+        client_ca_file: None,
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),

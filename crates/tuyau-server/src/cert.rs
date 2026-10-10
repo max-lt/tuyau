@@ -68,6 +68,26 @@ pub fn load_chain(
     Ok((chain, key))
 }
 
+/// Load a PEM bundle of CA certs, e.g. the CA that signs the client certs a
+/// public listener accepts.
+pub fn load_roots(path: &Path) -> Result<rustls::RootCertStore, CertError> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut roots = rustls::RootCertStore::empty();
+
+    for cert in rustls_pemfile::certs(&mut reader) {
+        roots
+            .add(cert?)
+            .map_err(|e| CertError::BadCa(path.display().to_string(), e.to_string()))?;
+    }
+
+    if roots.is_empty() {
+        return Err(CertError::PemNoCert(path.display().to_string()));
+    }
+
+    Ok(roots)
+}
+
 fn read_first_cert(path: &Path) -> Result<CertificateDer<'static>, CertError> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);

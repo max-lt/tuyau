@@ -117,6 +117,39 @@ impl Drop for IpPermit {
     }
 }
 
+/// Which client certs a terminated host accepts.
+#[derive(Debug, Clone)]
+pub(crate) enum ClientCert {
+    Any,
+    /// Only a cert signed by one of these roots; a client without a cert ends
+    /// its handshake (ACME validators have none) and is closed after it.
+    SignedBy(Arc<rustls::RootCertStore>),
+}
+
+/// The TLS config of the public listener, and whether a terminated host
+/// requires a client cert.
+#[derive(Clone)]
+pub(crate) struct PublicTls {
+    config: Arc<RustlsServerConfig>,
+    needs_client_cert: bool,
+}
+
+impl PublicTls {
+    pub(crate) fn new(
+        cert_resolver: Arc<dyn ResolvesServerCert>,
+        acme_active: bool,
+        client_cert: ClientCert,
+    ) -> Result<Self, ServerError> {
+        let needs_client_cert = matches!(client_cert, ClientCert::SignedBy(_));
+        let config = build_rustls_config(cert_resolver, acme_active, client_cert)?;
+
+        Ok(Self {
+            config: Arc::new(config),
+            needs_client_cert,
+        })
+    }
+}
+
 pub(crate) struct PublicListenerHandle {
     pub local_addr: SocketAddr,
     pub join: JoinHandle<()>,
@@ -124,8 +157,7 @@ pub(crate) struct PublicListenerHandle {
 
 pub(crate) async fn start(
     listen_addr: SocketAddr,
-    cert_resolver: Arc<dyn ResolvesServerCert>,
-    acme_active: bool,
+    tls: PublicTls,
     routes: RoutingTable,
     max_conns: usize,
     error_502: Arc<str>,
@@ -134,18 +166,8 @@ pub(crate) async fn start(
     let listener = TcpListener::bind(listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
-    let rustls_config = Arc::new(build_rustls_config(cert_resolver, acme_active)?);
-
     let join = tokio::spawn(async move {
-        accept_loop(
-            listener,
-            rustls_config,
-            routes,
-            max_conns,
-            error_502,
-            cancel,
-        )
-        .await;
+        accept_loop(listener, tls, routes, max_conns, error_502, cancel).await;
     });
 
     Ok(PublicListenerHandle { local_addr, join })
@@ -154,14 +176,26 @@ pub(crate) async fn start(
 fn build_rustls_config(
     cert_resolver: Arc<dyn ResolvesServerCert>,
     acme_active: bool,
+    client_cert: ClientCert,
 ) -> Result<RustlsServerConfig, ServerError> {
-    let mut config = RustlsServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(ServerError::Tls)?
-    .with_no_client_auth()
-    .with_cert_resolver(cert_resolver);
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = RustlsServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(ServerError::Tls)?;
+
+    let builder = match client_cert {
+        ClientCert::Any => builder.with_no_client_auth(),
+        ClientCert::SignedBy(roots) => {
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider)
+                    .allow_unauthenticated()
+                    .build()
+                    .map_err(|e| ServerError::ClientCa(e.to_string()))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+
+    let mut config = builder.with_cert_resolver(cert_resolver);
     // Advertise `h2` then `http/1.1` (preference order). We accept h2 from any
     // client because terminated mode now bridges h2→h1: we terminate h2 here and
     // talk h1 to the backend (see `h2proxy`), so the backend never needs to speak
@@ -183,7 +217,7 @@ fn build_rustls_config(
 
 async fn accept_loop(
     listener: TcpListener,
-    rustls_config: Arc<RustlsServerConfig>,
+    tls: PublicTls,
     routes: RoutingTable,
     max_conns: usize,
     error_502: Arc<str>,
@@ -232,13 +266,13 @@ async fn accept_loop(
                         continue;
                     }
                 };
-                let rustls_config = rustls_config.clone();
+                let tls = tls.clone();
                 let routes = routes.clone();
                 let error_502 = error_502.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // released when this connection ends
                     let _ip_permit = ip_permit; // decrements the per-IP count on end
-                    if let Err(e) = handle_public(stream, peer, rustls_config, routes, error_502).await {
+                    if let Err(e) = handle_public(stream, peer, tls, routes, error_502).await {
                         tracing::warn!(peer = %peer, error = %e, "public connection error");
                     }
                 });
@@ -250,7 +284,7 @@ async fn accept_loop(
 async fn handle_public(
     mut stream: TcpStream,
     peer: SocketAddr,
-    rustls_config: Arc<RustlsServerConfig>,
+    tls: PublicTls,
     routes: RoutingTable,
     error_502: Arc<str>,
 ) -> io::Result<()> {
@@ -291,7 +325,7 @@ async fn handle_public(
                 return Ok(());
             }
         };
-        let tls_stream = match start_handshake.into_stream(rustls_config).await {
+        let tls_stream = match start_handshake.into_stream(tls.config).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(peer = %peer, sni = %sni, error = %e, "TLS handshake failed");
@@ -304,6 +338,12 @@ async fn handle_public(
         let alpn = tls_stream.get_ref().1.alpn_protocol();
         if alpn == Some(rustls_acme::acme::ACME_TLS_ALPN_NAME) {
             tracing::info!(peer = %peer, sni = %sni, "acme-tls/1 challenge served");
+            return Ok(());
+        }
+
+        // rustls verified a cert that the client sent; this refuses no cert
+        if tls.needs_client_cert && tls_stream.get_ref().1.peer_certificates().is_none() {
+            tracing::warn!(peer = %peer, sni = %sni, "no client cert, closing");
             return Ok(());
         }
 

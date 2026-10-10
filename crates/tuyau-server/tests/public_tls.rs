@@ -1,5 +1,5 @@
-//! End-to-end: the public listener presents the cert that an upstream entry
-//! sets for its hostname, and the server-wide cert for the other hostnames.
+//! End-to-end TLS of the public listener: the cert an entry sets, wildcard and
+//! catch-all routes, and the client certs it accepts.
 
 use std::sync::Arc;
 
@@ -125,6 +125,7 @@ async fn a_hostname_with_its_own_cert_presents_it_and_the_others_get_the_default
         ],
         max_public_connections: None,
         error_502_file: None,
+        client_ca_file: None,
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
@@ -228,6 +229,7 @@ async fn the_catch_all_passes_unknown_hosts_through_and_a_wildcard_serves_its_ce
         ],
         max_public_connections: None,
         error_502_file: None,
+        client_ca_file: None,
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
@@ -258,4 +260,156 @@ async fn the_catch_all_passes_unknown_hosts_through_and_a_wildcard_serves_its_ce
     assert_eq!(&buf, b"ping");
 
     server.shutdown().await;
+}
+
+/// A cleartext backend that echoes what it reads, for `tls_offload` routes.
+async fn spawn_echo() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                while let Ok(n) = tcp.read(&mut buf).await {
+                    if n == 0 || tcp.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    addr
+}
+
+/// Whether "ping" sent to `sni` with `client_cert` comes back.
+async fn echoes(
+    public: std::net::SocketAddr,
+    sni: &str,
+    client_cert: Option<(rustls::pki_types::CertificateDer<'static>, &rcgen::KeyPair)>,
+) -> bool {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)));
+    let tls = match client_cert {
+        Some((cert, key)) => {
+            let key = rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap();
+            builder.with_client_auth_cert(vec![cert], key).unwrap()
+        }
+        None => builder.with_no_client_auth(),
+    };
+
+    let tcp = TcpStream::connect(public).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+    let Ok(mut stream) = TlsConnector::from(Arc::new(tls)).connect(name, tcp).await else {
+        return false;
+    };
+
+    if stream.write_all(b"ping").await.is_err() || stream.flush().await.is_err() {
+        return false;
+    }
+
+    let mut buf = [0u8; 4];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut buf),
+    )
+    .await;
+
+    matches!(read, Ok(Ok(_))) && &buf == b"ping"
+}
+
+#[tokio::test]
+async fn a_terminated_host_accepts_only_client_certs_signed_by_the_client_ca() {
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let ca_file = dir.path().join("origin-pull-ca.pem");
+    std::fs::write(&ca_file, ca.pem()).unwrap();
+
+    let proxy_key = rcgen::KeyPair::generate().unwrap();
+    let proxy = rcgen::CertificateParams::new(vec!["proxy.test".to_string()])
+        .unwrap()
+        .signed_by(&proxy_key, &ca, &ca_key)
+        .unwrap();
+
+    let stranger_key = rcgen::KeyPair::generate().unwrap();
+    let stranger = rcgen::CertificateParams::new(vec!["stranger.test".to_string()])
+        .unwrap()
+        .self_signed(&stranger_key)
+        .unwrap();
+
+    let (backend_cert, _, backend_key) = write_cert(dir.path(), "backend", "backend.test");
+    let tls_backend = spawn_tls_echo(&backend_cert, &backend_key).await;
+
+    let cfg = ServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+        tunnel_cert_dir: Some(dir.path().to_path_buf()),
+        clients: vec![],
+        hostnames: vec![],
+        acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
+        upstreams: vec![
+            upstream("app.test", spawn_echo().await, TlsMode::TlsOffload, None),
+            upstream("pass.test", tls_backend, TlsMode::Passthrough, None),
+        ],
+        max_public_connections: None,
+        error_502_file: None,
+        client_ca_file: Some(ca_file),
+    };
+    let server = TunnelServer::start(cfg).await.unwrap();
+    let public = server.public_local_addr().unwrap();
+
+    assert!(echoes(public, "app.test", Some((proxy.der().clone(), &proxy_key))).await);
+    assert!(!echoes(public, "app.test", None).await, "no client cert");
+    assert!(
+        !echoes(
+            public,
+            "app.test",
+            Some((stranger.der().clone(), &stranger_key))
+        )
+        .await,
+        "a cert of another CA"
+    );
+
+    // The backend of a passthrough host does its own handshake
+    assert!(echoes(public, "pass.test", None).await);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_ca_file_without_a_cert_stops_the_start() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let empty = dir.path().join("empty.pem");
+    std::fs::write(&empty, "").unwrap();
+
+    let cfg = ServerConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        public_listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+        tunnel_cert_dir: Some(dir.path().to_path_buf()),
+        clients: vec![],
+        hostnames: vec![],
+        acme: None,
+        tls_cert_file: None,
+        tls_key_file: None,
+        upstreams: vec![upstream(
+            "app.test",
+            spawn_echo().await,
+            TlsMode::TlsOffload,
+            None,
+        )],
+        max_public_connections: None,
+        error_502_file: None,
+        client_ca_file: Some(empty),
+    };
+
+    assert!(TunnelServer::start(cfg).await.is_err());
 }

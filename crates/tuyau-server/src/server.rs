@@ -146,6 +146,10 @@ impl TunnelServer {
                 )?;
                 let resolver = host_certs.resolver(resolver);
                 let acme_active = acme.is_some();
+                let client_cert = match &config.client_ca_file {
+                    Some(path) => public::ClientCert::SignedBy(Arc::new(cert::load_roots(path)?)),
+                    None => public::ClientCert::Any,
+                };
 
                 let max_conns = config
                     .max_public_connections
@@ -162,10 +166,10 @@ impl TunnelServer {
                     },
                     None => Arc::from(public::DEFAULT_502_HTML),
                 };
+                let tls = public::PublicTls::new(resolver, acme_active, client_cert)?;
                 let handle = public::start(
                     addr,
-                    resolver,
-                    acme_active,
+                    tls,
                     routes.clone(),
                     max_conns,
                     error_502,

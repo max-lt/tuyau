@@ -51,6 +51,13 @@ pub struct ServerConfig {
     /// deployment brand it (e.g. add a dashboard link).
     #[serde(default)]
     pub error_502_file: Option<PathBuf>,
+    /// Optional PEM CA bundle. When set, a host the server terminates TLS for
+    /// accepts only a client cert signed by it, e.g. the Cloudflare origin-pull
+    /// CA, so a client cannot bypass the proxy. A passthrough host is not
+    /// checked: the server does not take part in its handshake. An ACME
+    /// challenge passes without a client cert.
+    #[serde(default)]
+    pub client_ca_file: Option<PathBuf>,
 }
 
 /// ACME / Let's Encrypt parameters. The default `directory_url` points at LE

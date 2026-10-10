@@ -11,6 +11,9 @@ pub enum ServerError {
     #[error("tls: {0}")]
     Tls(#[from] rustls::Error),
 
+    #[error("client_ca_file: {0}")]
+    ClientCa(String),
+
     #[error("quic: invalid crypto config: {0}")]
     QuicCrypto(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
 
@@ -67,6 +70,9 @@ pub enum CertError {
 
     #[error("pem: no certificate found in {0}")]
     PemNoCert(String),
+
+    #[error("ca: {0} is not a CA cert: {1}")]
+    BadCa(String, String),
 
     #[error("pem: no private key found in {0}")]
     PemNoKey(String),
