@@ -14,6 +14,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub public_listen_addr: Option<SocketAddr>,
     pub tunnel_cert_dir: Option<PathBuf>,
+    #[serde(default)]
     pub clients: Vec<ClientEntry>,
     #[serde(default)]
     pub hostnames: Vec<HostnameEntry>,
@@ -353,6 +354,27 @@ mod tests {
         let cfg = ServerConfig::from_toml_str(toml).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.hostnames[0].tls_mode, TlsMode::TlsOffload);
+    }
+
+    #[test]
+    fn a_front_with_upstreams_only_needs_no_clients_key() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:4433"
+            [[upstreams]]
+            host = "a.example.com"
+            local_addr = "127.0.0.1:1"
+        "#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+
+        assert!(cfg.clients.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_no_clients_and_no_upstreams() {
+        let toml = r#"listen_addr = "0.0.0.0:4433""#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::NoClients)));
     }
 
     #[test]
