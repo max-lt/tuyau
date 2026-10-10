@@ -26,7 +26,8 @@ a local service.
 ## Features
 
 - **Hostname routing**: one server fronts many services on shared 443, routed
-  by SNI / Host header. Server config is the single source of truth for the
+  by SNI / Host header. A local upstream can also take `*.example.com` or the
+  catch-all `*`; the most specific entry wins. Server config is the single source of truth for the
   hostname → client binding.
 - **Per-client balancing**: when several tunnels share one client token, the
   server either hands over to the newest (`last-write-wins`, default — clean

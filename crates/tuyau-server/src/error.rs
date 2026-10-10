@@ -52,6 +52,9 @@ pub enum ConfigError {
 
     #[error("'{0}' sets a cert in passthrough mode, where the server holds no cert")]
     HostCertPassthrough(String),
+
+    #[error("host '{0}' is not a name, and an upstream host is not a name, '*.name' or '*'")]
+    HostPattern(String),
 }
 
 #[derive(Debug, Error)]

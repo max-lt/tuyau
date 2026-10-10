@@ -42,6 +42,21 @@ pub enum Route {
 #[derive(Debug, Clone)]
 struct LocalUpstream {
     target: UpstreamTarget,
+    tls_mode: TlsMode,
+}
+
+/// The entry keys a lowercase `host` matches, most specific first: the host,
+/// the wildcard of its parent (`*.example.com` for `a.example.com`), and the
+/// catch-all `*`. A wildcard covers one label, as in TLS.
+pub(crate) fn host_patterns(host: &str) -> Vec<String> {
+    let mut patterns = vec![host.to_string()];
+
+    if let Some((_, parent)) = host.split_once('.') {
+        patterns.push(format!("*.{parent}"));
+    }
+
+    patterns.push("*".to_string());
+    patterns
 }
 
 /// All tunnels currently serving one hostname. A hostname is owned by exactly
@@ -61,8 +76,13 @@ struct HostRoutes {
 pub struct RoutingTable {
     inner: Arc<RwLock<HashMap<String, HostRoutes>>>,
     /// Static local upstreams, fixed at construction (never change at runtime,
-    /// unlike tunnel routes). Take precedence over tunnels in `lookup`.
+    /// unlike tunnel routes), keyed by lowercase host or pattern. An exact
+    /// upstream takes precedence over tunnels in `lookup`; a `*.domain` or `*`
+    /// upstream serves only hosts that no exact entry names.
     local: Arc<HashMap<String, LocalUpstream>>,
+    /// The lowercase config hostnames of the tunnels. Such a host never falls
+    /// back to a wildcard upstream, also while no tunnel serves it.
+    tunnel_hosts: Arc<std::collections::HashSet<String>>,
     /// Hostnames the server terminates TLS for — the KNOWN set (config + the
     /// dynamic seam). The public listener decides "terminate this SNI?" from
     /// this (so an ACME challenge / the cert is served regardless of whether a
@@ -92,7 +112,11 @@ impl RoutingTable {
                     (None, Some(addr)) => UpstreamTarget::Tcp(addr),
                     (None, None) => return None,
                 };
-                Some((u.host.clone(), LocalUpstream { target }))
+                let upstream = LocalUpstream {
+                    target,
+                    tls_mode: u.tls_mode,
+                };
+                Some((u.host.to_ascii_lowercase(), upstream))
             })
             .collect();
         // A hostname needs TLS termination (a cert) in both `terminated` and
@@ -122,9 +146,14 @@ impl RoutingTable {
                     .map(|u| u.host.to_ascii_lowercase()),
             )
             .collect();
+        let tunnel_hosts = hostnames
+            .iter()
+            .map(|h| h.host.to_ascii_lowercase())
+            .collect();
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             local: Arc::new(local),
+            tunnel_hosts: Arc::new(tunnel_hosts),
             terminated: Arc::new(RwLock::new(terminated)),
             offload: Arc::new(RwLock::new(offload)),
         }
@@ -135,13 +164,45 @@ impl RoutingTable {
     /// cert and complete the handshake here. Case-insensitive — DNS hostnames
     /// are, and clients/LE lowercase the SNI.
     pub fn is_terminated(&self, host: &str) -> bool {
-        self.terminated.read().contains(&host.to_ascii_lowercase())
+        let host = host.to_ascii_lowercase();
+
+        if self.terminated.read().contains(&host) {
+            return true;
+        }
+
+        self.wildcard_upstream(&host)
+            .is_some_and(|up| matches!(up.tls_mode, TlsMode::Terminated | TlsMode::TlsOffload))
     }
 
     /// Whether `host` is in `tls_offload` mode: terminate TLS, then byte-pipe
     /// the plaintext with no HTTP parsing. A subset of `is_terminated`.
     pub fn is_offload(&self, host: &str) -> bool {
-        self.offload.read().contains(&host.to_ascii_lowercase())
+        let host = host.to_ascii_lowercase();
+
+        if self.offload.read().contains(&host) {
+            return true;
+        }
+
+        self.wildcard_upstream(&host)
+            .is_some_and(|up| up.tls_mode == TlsMode::TlsOffload)
+    }
+
+    /// The `*.domain` or `*` upstream of a lowercase `host` that no exact
+    /// entry (upstream, tunnel or provisioned hostname) names.
+    fn wildcard_upstream(&self, host: &str) -> Option<&LocalUpstream> {
+        let exact = self.local.contains_key(host)
+            || self.tunnel_hosts.contains(host)
+            || self.terminated.read().contains(host)
+            || self.inner.read().contains_key(host);
+
+        if exact {
+            return None;
+        }
+
+        host_patterns(host)
+            .iter()
+            .skip(1)
+            .find_map(|pattern| self.local.get(pattern))
     }
 
     /// Replace the whole terminated set. The caller (the dynamic seam) passes the
@@ -278,7 +339,14 @@ impl RoutingTable {
     /// cycle through them, skipping any already known closed; if every one is
     /// dead, returns `None`.
     pub fn lookup(&self, host: &str) -> Option<Route> {
-        if let Some(up) = self.local.get(host) {
+        let lowercase = host.to_ascii_lowercase();
+
+        let upstream = self
+            .local
+            .get(&lowercase)
+            .or_else(|| self.wildcard_upstream(&lowercase));
+
+        if let Some(up) = upstream {
             return Some(Route::Local {
                 target: up.target.clone(),
             });
@@ -308,6 +376,82 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upstream(host: &str, port: u16, tls_mode: TlsMode) -> UpstreamEntry {
+        UpstreamEntry {
+            host: host.into(),
+            local_addr: Some(SocketAddr::from(([127, 0, 0, 1], port))),
+            local_socket: None,
+            tls_mode,
+            tls_cert_file: None,
+            tls_key_file: None,
+        }
+    }
+
+    fn port(route: Option<Route>) -> Option<u16> {
+        match route? {
+            Route::Local {
+                target: UpstreamTarget::Tcp(addr),
+            } => Some(addr.port()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_exact_upstream_wins_over_a_wildcard_and_a_wildcard_over_the_catch_all() {
+        let table = RoutingTable::from_config(
+            &[],
+            &[
+                upstream("*", 1, TlsMode::Passthrough),
+                upstream("*.Example.com", 2, TlsMode::Terminated),
+                upstream("api.example.com", 3, TlsMode::Passthrough),
+            ],
+        );
+
+        assert_eq!(port(table.lookup("api.example.com")), Some(3));
+        assert_eq!(port(table.lookup("WWW.example.COM")), Some(2));
+        assert_eq!(port(table.lookup("a.b.example.com")), Some(1));
+        assert_eq!(port(table.lookup("example.com")), Some(1));
+        assert_eq!(port(table.lookup("other.org")), Some(1));
+    }
+
+    #[test]
+    fn a_host_takes_the_tls_mode_of_the_entry_that_routes_it() {
+        let table = RoutingTable::from_config(
+            &[],
+            &[
+                upstream("*", 1, TlsMode::Passthrough),
+                upstream("*.example.com", 2, TlsMode::TlsOffload),
+                upstream("api.example.com", 3, TlsMode::Passthrough),
+            ],
+        );
+
+        assert!(table.is_terminated("www.example.com"));
+        assert!(table.is_offload("www.example.com"));
+        assert!(!table.is_terminated("api.example.com"));
+        assert!(!table.is_terminated("other.org"));
+        assert!(!table.is_offload("other.org"));
+    }
+
+    #[test]
+    fn a_tunnel_hostname_never_falls_back_to_a_wildcard_upstream() {
+        let tunnel = HostnameEntry {
+            host: "app.example.com".into(),
+            client: "a".into(),
+            tls_mode: TlsMode::Passthrough,
+            tls_cert_file: None,
+            tls_key_file: None,
+        };
+        let table = RoutingTable::from_config(
+            &[tunnel],
+            &[upstream("*.example.com", 2, TlsMode::Terminated)],
+        );
+
+        // No tunnel is connected: the host has no route, not the wildcard's
+        assert!(table.lookup("app.example.com").is_none());
+        assert!(!table.is_terminated("app.example.com"));
+        assert_eq!(port(table.lookup("www.example.com")), Some(2));
+    }
 
     /// The SPOF guard: a panic while a routing-table guard is held must NOT
     /// wedge the table. With a std (poisoning) lock the post-panic calls below

@@ -111,7 +111,9 @@ pub struct HostnameEntry {
 }
 
 /// A static local upstream: a hostname served by forwarding to a local address
-/// instead of a client tunnel. Lets the server front existing local services —
+/// instead of a client tunnel. `host` can also be `*.example.com` (one label
+/// under `example.com`) or `*` (every host that no other entry names); an
+/// exact entry wins over a wildcard, and a wildcard over `*`. Lets the server front existing local services —
 /// e.g. route `db.example.com` to `127.0.0.1:8443`. `tls_mode` picks how TLS is
 /// handled:
 /// - `passthrough` forwards the raw TLS bytes (the upstream terminates its own
@@ -180,6 +182,7 @@ impl ServerConfig {
             }
         }
         self.validate_upstream_targets()?;
+        self.validate_host_patterns()?;
         self.validate_host_certs()?;
 
         let known_clients: HashSet<&str> = self.clients.iter().map(|c| c.name.as_str()).collect();
@@ -209,6 +212,7 @@ impl ServerConfig {
             }
         }
         self.validate_upstream_targets()?;
+        self.validate_host_patterns()?;
         self.validate_host_certs()?;
         self.validate_acme()
     }
@@ -221,6 +225,28 @@ impl ServerConfig {
                 return Err(ConfigError::UpstreamTarget(u.host.clone()));
             }
         }
+        Ok(())
+    }
+
+    /// An upstream host is a name, `*.name` or `*`; a tunnel hostname is a name.
+    fn validate_host_patterns(&self) -> Result<(), ConfigError> {
+        for h in &self.hostnames {
+            if h.host.contains('*') {
+                return Err(ConfigError::HostPattern(h.host.clone()));
+            }
+        }
+
+        for u in &self.upstreams {
+            let name = match u.host.as_str() {
+                "*" => continue,
+                host => host.strip_prefix("*.").unwrap_or(host),
+            };
+
+            if name.is_empty() || name.contains('*') {
+                return Err(ConfigError::HostPattern(u.host.clone()));
+            }
+        }
+
         Ok(())
     }
 
@@ -530,6 +556,53 @@ mod tests {
         assert!(matches!(
             upstream(&format!("tls_mode = \"passthrough\"\n{pair}")),
             Err(ConfigError::HostCertPassthrough(_))
+        ));
+    }
+
+    #[test]
+    fn an_upstream_host_is_a_name_a_one_label_wildcard_or_the_catch_all() {
+        let upstream = |host: &str| {
+            let toml = format!(
+                "listen_addr = \"0.0.0.0:4433\"\n[[upstreams]]\nhost = \"{host}\"\nlocal_addr = \"127.0.0.1:1\"\n"
+            );
+            ServerConfig::from_toml_str(&toml).unwrap().validate()
+        };
+
+        for host in ["a.example.com", "*.example.com", "*"] {
+            assert!(upstream(host).is_ok(), "{host}");
+        }
+
+        for host in [
+            "*.",
+            "**",
+            "a.*.example.com",
+            "*.*.example.com",
+            "*example.com",
+        ] {
+            assert!(
+                matches!(upstream(host), Err(ConfigError::HostPattern(_))),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tunnel_hostname_cannot_be_a_pattern() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:4433"
+            [[clients]]
+            name = "a"
+            token = "0000000000000000000000000000000000000000000000000000000000000001"
+            [[hostnames]]
+            host = "*.example.com"
+            client = "a"
+        "#;
+
+        let config = ServerConfig::from_toml_str(toml).unwrap();
+
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::HostPattern(_))
         ));
     }
 

@@ -128,9 +128,10 @@ impl TunnelServer {
                     .filter(|(_, mode, _, _)| terminates(*mode))
                     .map(|(host, _, _, _)| host.to_string())
                     .collect();
+                // ACME and the self-signed cert name hosts, not '*' patterns
                 let shared_hostnames: Vec<String> = terminated_hostnames
                     .iter()
-                    .filter(|host| !host_certs.covers(host))
+                    .filter(|host| !host.contains('*') && !host_certs.covers(host))
                     .cloned()
                     .collect();
 

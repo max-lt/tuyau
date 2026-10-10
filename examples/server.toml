@@ -64,6 +64,15 @@ tls_mode = "passthrough"
 # host = "console.example.com"
 # local_socket = "/run/tuyau/console.sock"
 # tls_mode = "terminated"
+#
+# An upstream host can be "*.example.com" (one label under example.com) or "*"
+# (every host that no other entry names). An exact entry wins over a wildcard,
+# and a wildcard over "*". E.g. send all other hosts, raw, to a service that
+# terminates its own TLS:
+# [[upstreams]]
+# host = "*"
+# local_addr = "127.0.0.1:50443"
+# tls_mode = "passthrough"
 
 # Optional ACME / Let's Encrypt block. When uncommented, the public listener
 # fetches real browser-trusted certs via TLS-ALPN-01 instead of using a dev

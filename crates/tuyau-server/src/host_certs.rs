@@ -46,8 +46,14 @@ impl HostCerts {
         Ok(Self(certs))
     }
 
+    /// The cert of the entry that routes `host`: the exact host, else its
+    /// `*.domain` wildcard, else the `*` catch-all, as the routing table does.
     fn select(&self, host: &str) -> Option<&Arc<CertifiedKey>> {
-        self.0.get(&host.trim_end_matches('.').to_ascii_lowercase())
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+
+        crate::routes::host_patterns(&host)
+            .iter()
+            .find_map(|pattern| self.0.get(pattern))
     }
 
     /// Whether `host` has its own cert, so ACME and the self-signed cert can
@@ -165,6 +171,42 @@ mod tests {
         assert_ne!(a.cert[0], b.cert[0]);
         assert!(!certs.covers("default.example.net"));
         assert!(!certs.covers("c.example.com"));
+    }
+
+    #[test]
+    fn a_host_without_an_entry_cert_takes_the_cert_of_its_wildcard_then_of_the_catch_all() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (wild_cert, wild_key) = write_cert(dir.path(), "wild.example.com");
+        let (any_cert, any_key) = write_cert(dir.path(), "any.example.org");
+
+        let certs = HostCerts::load(&config(&format!(
+            r#"
+            listen_addr = "127.0.0.1:0"
+
+            [[upstreams]]
+            host = "*.example.com"
+            local_addr = "127.0.0.1:1"
+            tls_cert_file = "{wild_cert}"
+            tls_key_file = "{wild_key}"
+
+            [[upstreams]]
+            host = "*"
+            local_addr = "127.0.0.1:2"
+            tls_cert_file = "{any_cert}"
+            tls_key_file = "{any_key}"
+            "#,
+            wild_cert = wild_cert.display(),
+            wild_key = wild_key.display(),
+            any_cert = any_cert.display(),
+            any_key = any_key.display(),
+        )))
+        .unwrap();
+
+        let wild = certs.select("www.example.com").unwrap();
+        let any = certs.select("other.org").unwrap();
+
+        assert_ne!(wild.cert[0], any.cert[0]);
+        assert!(Arc::ptr_eq(any, certs.select("a.b.example.com").unwrap()));
     }
 
     #[test]
