@@ -45,7 +45,7 @@ use crate::sni::parse_sni;
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECORD_SIZE: usize = 16 * 1024;
 /// Pause after a failed `accept()` before retrying. A persistent error — notably
 /// file-descriptor exhaustion (EMFILE/ENFILE), where `accept()` returns
@@ -230,6 +230,7 @@ async fn accept_loop(
     // Plus a per-IP cap so a single source can't hold every global permit and
     // starve the rest (including anything else this server fronts).
     let per_ip = PerIpLimiter::new(max_conns_per_ip(max_conns));
+    let pool = crate::local_pool::LocalPool::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -269,10 +270,11 @@ async fn accept_loop(
                 let tls = tls.clone();
                 let routes = routes.clone();
                 let error_502 = error_502.clone();
+                let pool = pool.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // released when this connection ends
                     let _ip_permit = ip_permit; // decrements the per-IP count on end
-                    if let Err(e) = handle_public(stream, peer, tls, routes, error_502).await {
+                    if let Err(e) = handle_public(stream, peer, tls, routes, pool, error_502).await {
                         tracing::warn!(peer = %peer, error = %e, "public connection error");
                     }
                 });
@@ -286,6 +288,7 @@ async fn handle_public(
     peer: SocketAddr,
     tls: PublicTls,
     routes: RoutingTable,
+    pool: crate::local_pool::LocalPool,
     error_502: Arc<str>,
 ) -> io::Result<()> {
     // 1. Read the ClientHello record off the wire (NOT peeking — consumed
@@ -368,6 +371,7 @@ async fn handle_public(
             crate::h2proxy::serve_h2(
                 tls_stream,
                 routes.clone(),
+                pool,
                 sni.clone(),
                 peer,
                 client,
@@ -387,6 +391,7 @@ async fn handle_public(
             crate::h2proxy::serve_h1(
                 tls_stream,
                 routes.clone(),
+                pool,
                 sni.clone(),
                 peer,
                 client,

@@ -47,6 +47,7 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # browsers get h2 without backends needing to speak it. Server-side only.
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+tower-service = "0.3"
 http-body-util = "0.1"
 
 # Serialization

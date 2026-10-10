@@ -6,8 +6,9 @@
 //! A terminated connection that negotiates ALPN `h2` can't be byte-piped: the
 //! browser speaks HTTP/2 framing, but the backend (over the tunnel, or a local
 //! upstream) speaks HTTP/1.1. So we run a hyper h2 server facing the browser
-//! and, per request, do an h1 client round-trip to the backend over a fresh
-//! stream.
+//! and, per request, do an h1 client round-trip to the backend: over a fresh
+//! tunnel stream, or a pooled keep-alive connection to a local upstream (see
+//! `local_pool`).
 //!
 //! This is the one place the server stops being a transparent byte-pipe and
 //! becomes a real HTTP reverse proxy — only for h2 connections. h1 (and any
@@ -15,8 +16,8 @@
 //!
 //! The win: browsers get h2 (one connection, multiplexing, HPACK) while the
 //! backend stays h1, with no end-to-end ALPN contract to honour. h2's request
-//! multiplexing maps onto one tunnel stream / backend connection per request —
-//! the same shape the byte-pipe uses, just per-request instead of per-connection.
+//! multiplexing maps onto one tunnel stream per request, or onto the pooled
+//! connections of a local upstream.
 //!
 //! WebSockets: browsers carry WebSocket over h2 via RFC 8441 Extended CONNECT
 //! (`:method=CONNECT`, `:protocol=websocket`). We advertise support, then
@@ -39,6 +40,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 
+use crate::local_pool::LocalPool;
 use crate::public::{connect_tcp, connect_unix, open_tunnel_stream};
 use crate::routes::{Route, RoutingTable, UpstreamTarget};
 
@@ -118,6 +120,7 @@ pub(crate) fn set_client_address(headers: &mut HeaderMap, peer: SocketAddr, clie
 pub(crate) async fn serve_h2<S>(
     tls_stream: S,
     routes: RoutingTable,
+    pool: LocalPool,
     sni: String,
     peer: SocketAddr,
     client: Client,
@@ -130,6 +133,7 @@ pub(crate) async fn serve_h2<S>(
         proxy(
             req,
             routes.clone(),
+            pool.clone(),
             sni.clone(),
             peer,
             client,
@@ -157,6 +161,7 @@ pub(crate) async fn serve_h2<S>(
 pub(crate) async fn serve_h1<S>(
     tls_stream: S,
     routes: RoutingTable,
+    pool: LocalPool,
     sni: String,
     peer: SocketAddr,
     client: Client,
@@ -169,6 +174,7 @@ pub(crate) async fn serve_h1<S>(
         proxy(
             req,
             routes.clone(),
+            pool.clone(),
             sni.clone(),
             peer,
             client,
@@ -191,6 +197,7 @@ pub(crate) async fn serve_h1<S>(
 async fn proxy(
     mut req: Request<Incoming>,
     routes: RoutingTable,
+    pool: LocalPool,
     sni: String,
     peer: SocketAddr,
     client: Client,
@@ -207,6 +214,9 @@ async fn proxy(
             // into one duplex for the h1 client.
             let io = tokio::io::join(recv, send);
             Ok(serve_request(io, req, &sni, peer, &error_502).await)
+        }
+        Some(Route::Local { target, .. }) if !needs_own_connection(&req) => {
+            Ok(pooled_roundtrip(&pool, &target, req, &sni, peer, &error_502).await)
         }
         Some(Route::Local { target, .. }) => match target {
             UpstreamTarget::Tcp(addr) => match connect_tcp(addr, &sni, peer).await {
@@ -248,6 +258,33 @@ where
         bad_gateway(error_502)
     } else {
         h1_roundtrip(io, req, sni, peer, error_502).await
+    }
+}
+
+/// Whether a request takes a backend connection for itself: a WebSocket, an h1
+/// upgrade, or a CONNECT. The other requests share the pooled connections.
+fn needs_own_connection(req: &Request<Incoming>) -> bool {
+    is_websocket_connect(req)
+        || req.headers().contains_key(UPGRADE)
+        || req.method() == Method::CONNECT
+}
+
+/// Forwards `req` to a local upstream on a pooled connection. A 502 page on any
+/// error.
+async fn pooled_roundtrip(
+    pool: &LocalPool,
+    target: &UpstreamTarget,
+    req: Request<Incoming>,
+    sni: &str,
+    peer: SocketAddr,
+    error_502: &str,
+) -> Response<ProxyBody> {
+    match pool.send(target, downgrade_to_h1(req, sni)).await {
+        Ok(resp) => resp.map(|b| b.boxed()),
+        Err(e) => {
+            tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend request failed");
+            bad_gateway(error_502)
+        }
     }
 }
 
@@ -330,6 +367,7 @@ fn downgrade_to_h1(mut req: Request<Incoming>, sni: &str) -> Request<Incoming> {
     if let Ok(host) = authority.parse() {
         req.headers_mut().insert(HOST, host);
     }
+    *req.version_mut() = hyper::Version::HTTP_11;
     req
 }
 

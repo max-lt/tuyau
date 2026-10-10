@@ -31,7 +31,8 @@ subtle = { workspace = true }
 sha2 = { workspace = true }
 parking_lot = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
+tower-service = { workspace = true }
 http-body-util = { workspace = true }
 
 [dev-dependencies]

@@ -7,6 +7,7 @@ mod control;
 mod error;
 mod h2proxy;
 mod host_certs;
+mod local_pool;
 mod public;
 mod routes;
 mod server;
