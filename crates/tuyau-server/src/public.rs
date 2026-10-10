@@ -355,6 +355,11 @@ async fn handle_public(
         // fatal NoApplicationProtocol from rustls; offload clients send none.)
         let offload = routes.is_offload(&sni);
 
+        let client = match tls.needs_client_cert {
+            true => crate::h2proxy::Client::Proxy,
+            false => crate::h2proxy::Client::Direct,
+        };
+
         // h2 negotiated → can't byte-pipe (the backend speaks h1). Terminate h2
         // and reverse-proxy each request to the backend as h1. Never for offload
         // (that host isn't HTTP — pipe its plaintext as-is below).
@@ -365,6 +370,22 @@ async fn handle_public(
                 routes.clone(),
                 sni.clone(),
                 peer,
+                client,
+                error_502.clone(),
+            )
+            .await;
+            return Ok(());
+        }
+
+        // An h1 client: proxy per request too, so each one gets X-Real-IP
+        if !offload && alpn == Some(b"http/1.1".as_slice()) {
+            tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, h1)");
+            crate::h2proxy::serve_h1(
+                tls_stream,
+                routes.clone(),
+                sni.clone(),
+                peer,
+                client,
                 error_502.clone(),
             )
             .await;

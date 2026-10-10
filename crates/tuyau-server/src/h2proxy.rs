@@ -1,4 +1,7 @@
-//! HTTP/2 termination for the public listener.
+//! HTTP termination for the public listener: h2, and h1 when the client
+//! negotiates ALPN `http/1.1`. Each request gets `X-Real-IP` (see
+//! [`set_client_address`]). A terminated connection without ALPN stays a
+//! byte-pipe in `public.rs`.
 //!
 //! A terminated connection that negotiates ALPN `h2` can't be byte-piped: the
 //! browser speaks HTTP/2 framing, but the backend (over the tunnel, or a local
@@ -28,7 +31,8 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::ext::Protocol;
 use hyper::header::{
-    CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE,
+    CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue, SEC_WEBSOCKET_KEY,
+    SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE,
 };
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -68,6 +72,46 @@ const BACKEND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// saves a randomness/base64 dependency.
 const WS_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
 
+/// A client must send all request headers in this time.
+const H1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+static X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
+static CF_CONNECTING_IP: HeaderName = HeaderName::from_static("cf-connecting-ip");
+
+/// Whether the client of a connection is a proxy that the server trusts to
+/// give the address of its own client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Client {
+    /// The connection passed the `client_ca_file` check, e.g. Cloudflare.
+    Proxy,
+    /// Any client: its address is the TCP peer.
+    Direct,
+}
+
+/// Sets `X-Real-IP` to the address of the client. A proxy client gives it in
+/// `CF-Connecting-IP`; otherwise it is the TCP peer, and the client cannot set
+/// either header.
+pub(crate) fn set_client_address(headers: &mut HeaderMap, peer: SocketAddr, client: Client) {
+    let forwarded = match client {
+        Client::Proxy => headers
+            .get(&CF_CONNECTING_IP)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok()),
+        Client::Direct => None,
+    };
+
+    if forwarded.is_none() {
+        headers.remove(&CF_CONNECTING_IP);
+    }
+
+    let address = forwarded.unwrap_or(peer.ip()).to_canonical().to_string();
+
+    headers.insert(
+        &X_REAL_IP,
+        HeaderValue::from_str(&address).expect("an address is a header value"),
+    );
+}
+
 /// Serve a terminated, h2-negotiated TLS stream as an HTTP/2 reverse proxy.
 /// Each request is bridged to the live backend over h1; the route is looked up
 /// per request so reconnects/rebalances take effect mid-connection.
@@ -76,13 +120,22 @@ pub(crate) async fn serve_h2<S>(
     routes: RoutingTable,
     sni: String,
     peer: SocketAddr,
+    client: Client,
     error_502: Arc<str>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(tls_stream);
-    let service =
-        service_fn(move |req| proxy(req, routes.clone(), sni.clone(), peer, error_502.clone()));
+    let service = service_fn(move |req| {
+        proxy(
+            req,
+            routes.clone(),
+            sni.clone(),
+            peer,
+            client,
+            error_502.clone(),
+        )
+    });
     let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
     builder
         .timer(TokioTimer::new()) // required by keep-alive below
@@ -98,16 +151,53 @@ pub(crate) async fn serve_h2<S>(
     }
 }
 
-/// Route and proxy a single h2 request to the live backend as h1. Always
-/// resolves to a `Response` (a 502 page on any backend failure) so the h2
-/// connection stays usable for sibling streams.
-async fn proxy(
-    req: Request<Incoming>,
+/// Serve a terminated TLS stream that negotiated ALPN `http/1.1` as an h1
+/// reverse proxy, one backend round-trip per request. Bodies stream; an h1
+/// upgrade (WebSocket) is spliced through to the backend.
+pub(crate) async fn serve_h1<S>(
+    tls_stream: S,
     routes: RoutingTable,
     sni: String,
     peer: SocketAddr,
+    client: Client,
+    error_502: Arc<str>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(tls_stream);
+    let service = service_fn(move |req| {
+        proxy(
+            req,
+            routes.clone(),
+            sni.clone(),
+            peer,
+            client,
+            error_502.clone(),
+        )
+    });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(H1_HEADER_READ_TIMEOUT);
+
+    if let Err(e) = builder.serve_connection(io, service).with_upgrades().await {
+        tracing::debug!(peer = %peer, error = %e, "h1 connection ended with error");
+    }
+}
+
+/// Route and proxy a single request to the live backend as h1. Always
+/// resolves to a `Response` (a 502 page on any backend failure) so the
+/// connection stays usable for the next requests.
+async fn proxy(
+    mut req: Request<Incoming>,
+    routes: RoutingTable,
+    sni: String,
+    peer: SocketAddr,
+    client: Client,
     error_502: Arc<str>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    set_client_address(req.headers_mut(), peer, client);
+
     match routes.lookup(&sni) {
         Some(Route::Tunnel(entry)) => {
             let Some((send, recv)) = open_tunnel_stream(&entry, &sni, peer).await else {
@@ -150,6 +240,8 @@ where
 {
     if is_websocket_connect(&req) {
         ws_bridge(io, req, sni, peer, error_502).await
+    } else if req.headers().contains_key(UPGRADE) {
+        h1_upgrade(io, req, sni, peer, error_502).await
     } else if req.method() == Method::CONNECT {
         // A non-WebSocket CONNECT to an origin isn't something we proxy.
         tracing::warn!(peer = %peer, sni = %sni, "unsupported CONNECT (not websocket)");
@@ -280,6 +372,7 @@ where
         .method(Method::GET)
         .uri(path)
         .header(HOST, authority)
+        .header(&X_REAL_IP, req.headers()[&X_REAL_IP].clone())
         .header(CONNECTION, "Upgrade")
         .header(UPGRADE, "websocket")
         .header(SEC_WEBSOCKET_VERSION, "13")
@@ -362,6 +455,73 @@ where
         .unwrap_or_else(|_| bad_gateway(error_502))
 }
 
+/// Forward an h1 upgrade request (e.g. WebSocket) as is, and once the backend
+/// answers 101, splice the client and backend byte streams. The backend's 101,
+/// with its `Sec-WebSocket-Accept`, goes back to the client unchanged.
+async fn h1_upgrade<S>(
+    backend: S,
+    mut req: Request<Incoming>,
+    sni: &str,
+    peer: SocketAddr,
+    error_502: &str,
+) -> Response<ProxyBody>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let client_up = hyper::upgrade::on(&mut req);
+
+    let mut breq = Request::new(Empty::<Bytes>::new());
+    *breq.method_mut() = req.method().clone();
+    *breq.uri_mut() = req.uri().clone();
+    *breq.headers_mut() = req.headers().clone();
+
+    let handshake = hyper::client::conn::http1::handshake(TokioIo::new(backend));
+    let (mut sender, conn) = match tokio::time::timeout(BACKEND_HANDSHAKE_TIMEOUT, handshake).await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend upgrade handshake failed");
+            return bad_gateway(error_502);
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer, sni = %sni, "backend upgrade handshake timed out");
+            return bad_gateway(error_502);
+        }
+    };
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+
+    let mut bresp = match sender.send_request(breq).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(peer = %peer, sni = %sni, error = %e, "backend upgrade request failed");
+            return bad_gateway(error_502);
+        }
+    };
+
+    if bresp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return bresp.map(|b| b.boxed());
+    }
+
+    let backend_up = hyper::upgrade::on(&mut bresp);
+    tokio::spawn(async move {
+        match tokio::try_join!(client_up, backend_up) {
+            Ok((client_up, backend_up)) => {
+                let mut a = TokioIo::new(client_up);
+                let mut b = TokioIo::new(backend_up);
+                if let Err(e) = copy_bidirectional(&mut a, &mut b).await {
+                    tracing::debug!(error = %e, "upgrade splice ended with error");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "h1 upgrade failed"),
+        }
+    });
+
+    let (parts, _) = bresp.into_parts();
+    Response::from_parts(parts, empty_body())
+}
+
 /// An empty boxed body for the WebSocket `200` response.
 fn empty_body() -> ProxyBody {
     Empty::<Bytes>::new()
@@ -380,4 +540,69 @@ fn bad_gateway(body: &str) -> Response<ProxyBody> {
         .header("content-type", "text/html; charset=utf-8")
         .body(full)
         .expect("static 502 response is always valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+
+        for (name, value) in pairs {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+
+        headers
+    }
+
+    const PEER: &str = "192.0.2.1:4000";
+
+    #[test]
+    fn a_proxy_gives_the_client_address_in_cf_connecting_ip() {
+        let mut h = headers(&[
+            ("cf-connecting-ip", " 2001:db8::7 "),
+            ("x-real-ip", "198.51.100.9"),
+        ]);
+
+        set_client_address(&mut h, PEER.parse().unwrap(), Client::Proxy);
+
+        assert_eq!(h["x-real-ip"], "2001:db8::7");
+        assert_eq!(h["cf-connecting-ip"], " 2001:db8::7 ");
+    }
+
+    #[test]
+    fn a_direct_client_cannot_set_its_address() {
+        let mut h = headers(&[
+            ("cf-connecting-ip", "203.0.113.7"),
+            ("x-real-ip", "198.51.100.9"),
+        ]);
+
+        set_client_address(&mut h, PEER.parse().unwrap(), Client::Direct);
+
+        assert_eq!(h["x-real-ip"], "192.0.2.1");
+        assert!(!h.contains_key("cf-connecting-ip"));
+    }
+
+    #[test]
+    fn a_proxy_without_a_valid_address_gives_the_peer() {
+        for value in [None, Some("not an address")] {
+            let mut h = HeaderMap::new();
+            if let Some(value) = value {
+                h.insert(&CF_CONNECTING_IP, HeaderValue::from_static(value));
+            }
+
+            set_client_address(
+                &mut h,
+                "[::ffff:192.0.2.1]:4000".parse().unwrap(),
+                Client::Proxy,
+            );
+
+            assert_eq!(h["x-real-ip"], "192.0.2.1", "{value:?}");
+            assert!(!h.contains_key("cf-connecting-ip"), "{value:?}");
+        }
+    }
 }

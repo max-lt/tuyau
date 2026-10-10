@@ -63,6 +63,13 @@ a local service.
 - **Client cert check**: `client_ca_file` makes the hosts tuyau terminates
   accept only clients with a cert signed by that CA, e.g. Cloudflare
   Authenticated Origin Pulls, so nobody bypasses the proxy.
+- **Client address**: on a `terminated` host, each HTTP request reaches the
+  backend with `X-Real-IP`. When the connection passed the `client_ca_file`
+  check, the value comes from `CF-Connecting-IP`; otherwise it is the TCP
+  peer, and the server removes the `CF-Connecting-IP` and `X-Real-IP` that
+  the client sent, so a client cannot give a false address. This applies
+  when the client negotiates ALPN `h2` or `http/1.1`; a connection without
+  ALPN stays a byte-pipe and gets no header.
 - **Custom 502 page**: when a terminated hostname has no live tunnel, the
   server answers with a proper 502 page instead of dropping the connection
   — overridable per deployment via `error_502_file`.
