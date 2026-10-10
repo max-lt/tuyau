@@ -8,6 +8,7 @@ mod error;
 mod h2proxy;
 mod host_certs;
 mod local_pool;
+mod meter;
 mod public;
 mod routes;
 mod server;

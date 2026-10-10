@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use tuyau_protocol::{DataStreamHeader, FrameCodec};
 
 use crate::error::ServerError;
+use crate::meter::{Meter, Metered};
 use crate::routes::{Route, RouteEntry, RoutingTable, UpstreamTarget};
 use crate::sni::parse_sni;
 
@@ -274,23 +275,38 @@ async fn accept_loop(
                 tokio::spawn(async move {
                     let _permit = permit; // released when this connection ends
                     let _ip_permit = ip_permit; // decrements the per-IP count on end
+                    let meter = Arc::new(Meter::default());
+                    let start = std::time::Instant::now();
+                    let stream = Metered::new(stream, meter.clone());
+
                     if let Err(e) = handle_public(stream, peer, tls, routes, pool, error_502).await {
                         tracing::warn!(peer = %peer, error = %e, "public connection error");
                     }
+
+                    tracing::info!(
+                        peer = %peer,
+                        duration_ms = start.elapsed().as_millis() as u64,
+                        bytes_in = meter.read(),
+                        bytes_out = meter.written(),
+                        "public connection closed"
+                    );
                 });
             }
         }
     }
 }
 
-async fn handle_public(
-    mut stream: TcpStream,
+async fn handle_public<S>(
+    mut stream: S,
     peer: SocketAddr,
     tls: PublicTls,
     routes: RoutingTable,
     pool: crate::local_pool::LocalPool,
     error_502: Arc<str>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // 1. Read the ClientHello record off the wire (NOT peeking — consumed
     //    bytes are replayed below via PrefixedStream so both terminated and
     //    passthrough paths see the same stream the client sent).
@@ -567,7 +583,7 @@ pub(crate) async fn open_tunnel_stream(
 /// Read exactly one TLS record from `stream` into a Vec (header + body).
 /// Caps at `MAX_RECORD_SIZE` so a malicious or malformed length field can't
 /// allocate unbounded memory.
-async fn read_client_hello(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+async fn read_client_hello<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; 5];
     stream.read_exact(&mut buf).await?;
     if buf[0] != 0x16 {
