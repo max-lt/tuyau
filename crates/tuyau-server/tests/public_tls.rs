@@ -414,8 +414,8 @@ async fn a_client_ca_file_without_a_cert_stops_the_start() {
     assert!(TunnelServer::start(cfg).await.is_err());
 }
 
-/// An h1 backend that answers "<x-real-ip>|<cf-connecting-ip or ->", and
-/// echoes the bytes of an upgraded connection.
+/// An h1 backend that answers "<x-real-ip>|<x-forwarded-for>|<cf-connecting-ip>"
+/// ("-" for a missing header), and echoes the bytes of an upgraded connection.
 async fn spawn_address_backend() -> std::net::SocketAddr {
     use http_body_util::Full;
     use hyper::body::Bytes;
@@ -434,8 +434,12 @@ async fn spawn_address_backend() -> std::net::SocketAddr {
                                 .get(name)
                                 .map_or("-".to_string(), |v| v.to_str().unwrap().to_string())
                         };
-                        let body =
-                            format!("{}|{}", header("x-real-ip"), header("cf-connecting-ip"));
+                        let body = format!(
+                            "{}|{}|{}",
+                            header("x-real-ip"),
+                            header("x-forwarded-for"),
+                            header("cf-connecting-ip")
+                        );
 
                         if req.headers().contains_key(hyper::header::UPGRADE) {
                             let upgrade = hyper::upgrade::on(&mut req);
@@ -578,8 +582,9 @@ async fn start_terminated(
     TunnelServer::start(cfg).await.unwrap()
 }
 
-const FORGED: [(&str, &str); 2] = [
+const FORGED: [(&str, &str); 3] = [
     ("x-real-ip", "198.51.100.9"),
+    ("x-forwarded-for", "198.51.100.9"),
     ("cf-connecting-ip", "203.0.113.7"),
 ];
 
@@ -592,7 +597,7 @@ async fn without_a_client_ca_the_backend_gets_the_peer_and_no_forged_address() {
     for alpn in [b"http/1.1".as_slice(), b"h2"] {
         assert_eq!(
             backend_saw(public, "app.test", alpn, None, &FORGED).await,
-            "127.0.0.1|-"
+            "127.0.0.1|127.0.0.1|-"
         );
     }
 
@@ -611,7 +616,7 @@ async fn behind_the_client_ca_the_backend_gets_cf_connecting_ip() {
 
         assert_eq!(
             backend_saw(public, "app.test", alpn, cert(), &FORGED).await,
-            "203.0.113.7|203.0.113.7"
+            "203.0.113.7|203.0.113.7|203.0.113.7"
         );
         assert_eq!(
             backend_saw(
@@ -622,7 +627,7 @@ async fn behind_the_client_ca_the_backend_gets_cf_connecting_ip() {
                 &[("cf-connecting-ip", "nope")]
             )
             .await,
-            "127.0.0.1|-"
+            "127.0.0.1|127.0.0.1|-"
         );
     }
 
@@ -659,12 +664,52 @@ async fn an_h1_websocket_upgrade_reaches_the_backend_with_the_client_address() {
     let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
 
     assert!(head.starts_with("http/1.1 101"), "{head}");
-    assert!(head.contains("x-backend-saw: 127.0.0.1|-"), "{head}");
+    assert!(
+        head.contains("x-backend-saw: 127.0.0.1|127.0.0.1|-"),
+        "{head}"
+    );
 
     tls.write_all(b"frame").await.unwrap();
     let mut buf = [0u8; 5];
     tls.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"frame");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_without_alpn_cannot_bring_its_own_address_to_an_upstream() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let server = start_terminated(dir.path(), spawn_address_backend().await, None).await;
+    let public = server.public_local_addr().unwrap();
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+        .with_no_client_auth();
+    assert!(tls.alpn_protocols.is_empty());
+
+    let tcp = TcpStream::connect(public).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("app.test").unwrap();
+    let mut stream = TlsConnector::from(Arc::new(tls))
+        .connect(name, tcp)
+        .await
+        .unwrap();
+
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: app.test\r\nX-Real-IP: 198.51.100.9\r\n\
+              X-Forwarded-For: 198.51.100.9\r\nCF-Connecting-IP: 203.0.113.7\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.ok();
+
+    assert!(response.ends_with("127.0.0.1|127.0.0.1|-"), "{response}");
 
     server.shutdown().await;
 }

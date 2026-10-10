@@ -187,6 +187,14 @@ impl RoutingTable {
             .is_some_and(|up| up.tls_mode == TlsMode::TlsOffload)
     }
 
+    /// Whether `host` goes to a local upstream (exact, wildcard or catch-all)
+    /// rather than to a tunnel. Does not touch the tunnel round-robin.
+    pub fn routes_to_upstream(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+
+        self.local.contains_key(&host) || self.wildcard_upstream(&host).is_some()
+    }
+
     /// The `*.domain` or `*` upstream of a lowercase `host` that no exact
     /// entry (upstream, tunnel or provisioned hostname) names.
     fn wildcard_upstream(&self, host: &str) -> Option<&LocalUpstream> {

@@ -377,8 +377,12 @@ async fn handle_public(
             return Ok(());
         }
 
-        // An h1 client: proxy per request too, so each one gets X-Real-IP
-        if !offload && alpn == Some(b"http/1.1".as_slice()) {
+        // An upstream entry is HTTP, so a client without ALPN is h1 too, or it
+        // could pass its own X-Real-IP through a byte-pipe
+        let h1 = alpn == Some(b"http/1.1".as_slice())
+            || (alpn.is_none() && routes.routes_to_upstream(&sni));
+
+        if !offload && h1 {
             tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, h1)");
             crate::h2proxy::serve_h1(
                 tls_stream,

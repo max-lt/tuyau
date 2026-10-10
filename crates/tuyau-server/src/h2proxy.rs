@@ -1,7 +1,7 @@
 //! HTTP termination for the public listener: h2, and h1 when the client
-//! negotiates ALPN `http/1.1`. Each request gets `X-Real-IP` (see
-//! [`set_client_address`]). A terminated connection without ALPN stays a
-//! byte-pipe in `public.rs`.
+//! negotiates ALPN `http/1.1` or reaches an upstream without ALPN. Each request
+//! gets the client address (see [`set_client_address`]). A tunnel host without
+//! ALPN stays a byte-pipe in `public.rs`.
 //!
 //! A terminated connection that negotiates ALPN `h2` can't be byte-piped: the
 //! browser speaks HTTP/2 framing, but the backend (over the tunnel, or a local
@@ -76,6 +76,7 @@ const WS_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
 const H1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 static X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
+static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 static CF_CONNECTING_IP: HeaderName = HeaderName::from_static("cf-connecting-ip");
 
 /// Whether the client of a connection is a proxy that the server trusts to
@@ -88,9 +89,9 @@ pub(crate) enum Client {
     Direct,
 }
 
-/// Sets `X-Real-IP` to the address of the client. A proxy client gives it in
-/// `CF-Connecting-IP`; otherwise it is the TCP peer, and the client cannot set
-/// either header.
+/// Sets `X-Real-IP` and `X-Forwarded-For` to the address of the client. A
+/// proxy client gives it in `CF-Connecting-IP`; otherwise it is the TCP peer,
+/// and the client cannot set any of the three headers.
 pub(crate) fn set_client_address(headers: &mut HeaderMap, peer: SocketAddr, client: Client) {
     let forwarded = match client {
         Client::Proxy => headers
@@ -105,11 +106,10 @@ pub(crate) fn set_client_address(headers: &mut HeaderMap, peer: SocketAddr, clie
     }
 
     let address = forwarded.unwrap_or(peer.ip()).to_canonical().to_string();
+    let address = HeaderValue::from_str(&address).expect("an address is a header value");
 
-    headers.insert(
-        &X_REAL_IP,
-        HeaderValue::from_str(&address).expect("an address is a header value"),
-    );
+    headers.insert(&X_FORWARDED_FOR, address.clone());
+    headers.insert(&X_REAL_IP, address);
 }
 
 /// Serve a terminated, h2-negotiated TLS stream as an HTTP/2 reverse proxy.
@@ -373,6 +373,7 @@ where
         .uri(path)
         .header(HOST, authority)
         .header(&X_REAL_IP, req.headers()[&X_REAL_IP].clone())
+        .header(&X_FORWARDED_FOR, req.headers()[&X_FORWARDED_FOR].clone())
         .header(CONNECTION, "Upgrade")
         .header(UPGRADE, "websocket")
         .header(SEC_WEBSOCKET_VERSION, "13")
@@ -571,6 +572,7 @@ mod tests {
         set_client_address(&mut h, PEER.parse().unwrap(), Client::Proxy);
 
         assert_eq!(h["x-real-ip"], "2001:db8::7");
+        assert_eq!(h["x-forwarded-for"], "2001:db8::7");
         assert_eq!(h["cf-connecting-ip"], " 2001:db8::7 ");
     }
 
@@ -579,11 +581,13 @@ mod tests {
         let mut h = headers(&[
             ("cf-connecting-ip", "203.0.113.7"),
             ("x-real-ip", "198.51.100.9"),
+            ("x-forwarded-for", "198.51.100.9, 10.0.0.1"),
         ]);
 
         set_client_address(&mut h, PEER.parse().unwrap(), Client::Direct);
 
         assert_eq!(h["x-real-ip"], "192.0.2.1");
+        assert_eq!(h["x-forwarded-for"], "192.0.2.1");
         assert!(!h.contains_key("cf-connecting-ip"));
     }
 

@@ -64,12 +64,13 @@ a local service.
   accept only clients with a cert signed by that CA, e.g. Cloudflare
   Authenticated Origin Pulls, so nobody bypasses the proxy.
 - **Client address**: on a `terminated` host, each HTTP request reaches the
-  backend with `X-Real-IP`. When the connection passed the `client_ca_file`
-  check, the value comes from `CF-Connecting-IP`; otherwise it is the TCP
-  peer, and the server removes the `CF-Connecting-IP` and `X-Real-IP` that
-  the client sent, so a client cannot give a false address. This applies
-  when the client negotiates ALPN `h2` or `http/1.1`; a connection without
-  ALPN stays a byte-pipe and gets no header.
+  backend with `X-Real-IP` and `X-Forwarded-For` set to the client address.
+  When the connection passed the `client_ca_file` check, that address comes
+  from `CF-Connecting-IP`; otherwise it is the TCP peer, and the server
+  removes the `CF-Connecting-IP`, `X-Real-IP` and `X-Forwarded-For` that the
+  client sent, so a client cannot give a false address. A local upstream is
+  always HTTP: a client without ALPN goes through the proxy as HTTP/1.1. A
+  tunnel host without ALPN stays a byte-pipe (e.g. SSH) and gets no header.
 - **Custom 502 page**: when a terminated hostname has no live tunnel, the
   server answers with a proper 502 page instead of dropping the connection
   — overridable per deployment via `error_502_file`.
