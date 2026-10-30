@@ -255,7 +255,7 @@ impl ServerConfig {
         }
 
         self.validate_acme()?;
-        self.validate_issuers()
+        self.validate_issuers(IssuerNames::Configured)
     }
 
     /// Validation for dynamic mode (`dynamic` feature): the routing backend
@@ -275,7 +275,7 @@ impl ServerConfig {
         self.validate_host_patterns()?;
         self.validate_host_certs()?;
         self.validate_acme()?;
-        self.validate_issuers()
+        self.validate_issuers(IssuerNames::SetLater)
     }
 
     /// Each upstream must name exactly one target: a TCP `local_addr` or a Unix
@@ -413,7 +413,7 @@ impl ServerConfig {
         hostnames.chain(upstreams)
     }
 
-    fn validate_issuers(&self) -> Result<(), ConfigError> {
+    fn validate_issuers(&self, names: IssuerNames) -> Result<(), ConfigError> {
         let legacy =
             self.acme.is_some() || self.tls_cert_file.is_some() || self.tls_key_file.is_some();
 
@@ -434,6 +434,10 @@ impl ServerConfig {
             }
 
             let Some(issuer) = issuers.iter().find(|i| i.name == name) else {
+                if names == IssuerNames::SetLater {
+                    continue;
+                }
+
                 return Err(ConfigError::UnknownIssuer {
                     host: host.to_string(),
                     issuer: name.to_string(),
@@ -447,6 +451,17 @@ impl ServerConfig {
 
         Ok(())
     }
+}
+
+/// Where the issuer names of the entries come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssuerNames {
+    /// `issuers` holds them all.
+    Configured,
+    /// The dynamic seam sets the issuers after the start: an unknown name
+    /// takes the default issuer until one with that name arrives.
+    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
+    SetLater,
 }
 
 /// Names are unique, at most one issuer is the default, and an ACME contact is
@@ -952,6 +967,22 @@ mod tests {
         "#;
         let cfg = ServerConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.hostnames[0].tls_mode, TlsMode::Terminated);
+    }
+
+    #[cfg(feature = "dynamic")]
+    #[test]
+    fn a_dynamic_server_takes_an_issuer_name_that_arrives_after_the_start() {
+        let config = ServerConfig::from_toml_str(
+            "listen_addr = \"127.0.0.1:4433\"\n\
+             [[upstreams]]\nhost = \"a.example.com\"\nlocal_addr = \"127.0.0.1:1\"\nissuer = \"later\"",
+        )
+        .unwrap();
+
+        assert!(config.validate_dynamic().is_ok());
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UnknownIssuer { .. })
+        ));
     }
 
     #[cfg(feature = "dynamic")]
