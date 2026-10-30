@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// Non-poisoning lock on the handshake path, as in routes.rs
+use parking_lot::RwLock;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
@@ -57,34 +59,35 @@ impl HostCerts {
     }
 
     /// A resolver that serves these certs and asks `default` for the other
-    /// hostnames.
-    pub(crate) fn resolver(
-        self,
-        default: Arc<dyn ResolvesServerCert>,
-    ) -> Arc<dyn ResolvesServerCert> {
-        if self.0.is_empty() {
-            return default;
-        }
-
+    /// hostnames. A reload replaces the certs in it.
+    pub(crate) fn resolver(self, default: Arc<dyn ResolvesServerCert>) -> Arc<HostCertResolver> {
         Arc::new(HostCertResolver {
-            certs: self,
+            certs: RwLock::new(self),
             default,
         })
     }
 }
 
 #[derive(Debug)]
-struct HostCertResolver {
-    certs: HostCerts,
+pub(crate) struct HostCertResolver {
+    certs: RwLock<HostCerts>,
     default: Arc<dyn ResolvesServerCert>,
+}
+
+impl HostCertResolver {
+    pub(crate) fn replace(&self, certs: HostCerts) {
+        *self.certs.write() = certs;
+    }
 }
 
 impl ResolvesServerCert for HostCertResolver {
     fn resolve(&self, ch: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let own = ch.server_name().and_then(|sni| self.certs.select(sni));
+        let own = ch
+            .server_name()
+            .and_then(|sni| self.certs.read().select(sni).cloned());
 
         match own {
-            Some(certified) => Some(certified.clone()),
+            Some(certified) => Some(certified),
             None => self.default.resolve(ch),
         }
     }

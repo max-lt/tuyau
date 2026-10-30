@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use subtle::ConstantTimeEq;
 
 use crate::config::{Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode};
@@ -29,6 +30,10 @@ pub trait RoutingBackend: Send + Sync {
 /// Static, config-backed backend — the historical behaviour. The server config
 /// is the source of truth for token → client and client → hostnames.
 pub struct StaticBackend {
+    config: RwLock<StaticConfig>,
+}
+
+struct StaticConfig {
     clients: Vec<ClientEntry>,
     hostnames: Vec<HostnameEntry>,
 }
@@ -36,15 +41,33 @@ pub struct StaticBackend {
 impl StaticBackend {
     pub fn new(cfg: &ServerConfig) -> Self {
         Self {
-            clients: cfg.clients.clone(),
-            hostnames: cfg.hostnames.clone(),
+            config: RwLock::new(StaticConfig::of(cfg)),
         }
+    }
+
+    /// Admit with the clients and hostnames of `cfg` from now on; a connected
+    /// tunnel keeps its grant until it reconnects.
+    pub(crate) fn replace(&self, cfg: &ServerConfig) {
+        *self.config.write() = StaticConfig::of(cfg);
     }
 }
 
 #[async_trait]
 impl RoutingBackend for StaticBackend {
     async fn admit(&self, token: &[u8; 32]) -> Option<ClientGrant> {
+        self.config.read().grant(token)
+    }
+}
+
+impl StaticConfig {
+    fn of(cfg: &ServerConfig) -> Self {
+        Self {
+            clients: cfg.clients.clone(),
+            hostnames: cfg.hostnames.clone(),
+        }
+    }
+
+    fn grant(&self, token: &[u8; 32]) -> Option<ClientGrant> {
         // Constant-time comparison against every entry; the last match wins
         // (preserves the prior `match_token` behaviour).
         let mut matched: Option<&ClientEntry> = None;

@@ -88,6 +88,13 @@ a local service.
 - **Built to stay up**: non-poisoning routing locks, global + per-IP
   connection caps, accept-loop backpressure, and a liveness probe
   (`TunnelServer::healthy()`) ready to wire into a systemd watchdog.
+- **Reload without a restart**, as nginx: `tuyau server --config server.toml -t`
+  checks the config and loads its cert files, keys and issuers;
+  `-s reload` sends SIGHUP to the server named by `pid_file`. The server
+  loads the routes, the cert files and the issuers again, and keeps serving
+  on the same sockets. A config that does not load changes nothing. The
+  listen addresses, the tunnel cert, `client_ca_file`, `error_502_file` and
+  `max_public_connections` need a restart.
 
 ## Build
 

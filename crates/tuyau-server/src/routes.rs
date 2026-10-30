@@ -72,17 +72,22 @@ struct HostRoutes {
     cursor: AtomicUsize,
 }
 
+#[derive(Debug, Default)]
+struct ConfigRoutes {
+    /// Static local upstreams, keyed by lowercase host or pattern. An exact
+    /// upstream takes precedence over tunnels in `lookup`; a `*.domain` or `*`
+    /// upstream serves only hosts that no exact entry names.
+    local: HashMap<String, LocalUpstream>,
+    /// The lowercase config hostnames of the tunnels. Such a host never falls
+    /// back to a wildcard upstream, also while no tunnel serves it.
+    tunnel_hosts: HostSet,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RoutingTable {
     inner: Arc<RwLock<HashMap<String, HostRoutes>>>,
-    /// Static local upstreams, fixed at construction (never change at runtime,
-    /// unlike tunnel routes), keyed by lowercase host or pattern. An exact
-    /// upstream takes precedence over tunnels in `lookup`; a `*.domain` or `*`
-    /// upstream serves only hosts that no exact entry names.
-    local: Arc<HashMap<String, LocalUpstream>>,
-    /// The lowercase config hostnames of the tunnels. Such a host never falls
-    /// back to a wildcard upstream, also while no tunnel serves it.
-    tunnel_hosts: Arc<std::collections::HashSet<String>>,
+    /// The routes of the config; a reload replaces them at once.
+    config: Arc<RwLock<ConfigRoutes>>,
     /// Hostnames the server terminates TLS for — the KNOWN set (config + the
     /// dynamic seam). The public listener decides "terminate this SNI?" from
     /// this (so an ACME challenge / the cert is served regardless of whether a
@@ -104,61 +109,115 @@ impl RoutingTable {
     /// an entry with neither is defensively skipped. In dynamic mode `hostnames`
     /// is empty (the backend owns them) and the seam seeds the terminated set.
     pub fn from_config(hostnames: &[HostnameEntry], upstreams: &[UpstreamEntry]) -> Self {
-        let local = upstreams
-            .iter()
-            .filter_map(|u| {
-                let target = match (&u.local_socket, u.local_addr) {
-                    (Some(path), _) => UpstreamTarget::Unix(path.clone()),
-                    (None, Some(addr)) => UpstreamTarget::Tcp(addr),
-                    (None, None) => return None,
-                };
-                let upstream = LocalUpstream {
-                    target,
-                    tls_mode: u.tls_mode,
-                };
-                Some((u.host.to_ascii_lowercase(), upstream))
-            })
-            .collect();
-        // A hostname needs TLS termination (a cert) in both `terminated` and
-        // `tls_offload` mode — they only diverge after the handshake. Seed the
-        // termination set with both, from tunnel routes AND local upstreams.
-        let terminates = |m: TlsMode| matches!(m, TlsMode::Terminated | TlsMode::TlsOffload);
-        let terminated = hostnames
-            .iter()
-            .filter(|h| terminates(h.tls_mode))
-            .map(|h| h.host.to_ascii_lowercase())
-            .chain(
-                upstreams
-                    .iter()
-                    .filter(|u| terminates(u.tls_mode))
-                    .map(|u| u.host.to_ascii_lowercase()),
-            )
-            .collect();
-        // The offload subset: terminate TLS, then byte-pipe plaintext (no HTTP).
-        let offload = hostnames
-            .iter()
-            .filter(|h| h.tls_mode == TlsMode::TlsOffload)
-            .map(|h| h.host.to_ascii_lowercase())
-            .chain(
-                upstreams
-                    .iter()
-                    .filter(|u| u.tls_mode == TlsMode::TlsOffload)
-                    .map(|u| u.host.to_ascii_lowercase()),
-            )
-            .collect();
-        let tunnel_hosts = hostnames
-            .iter()
-            .map(|h| h.host.to_ascii_lowercase())
-            .collect();
+        let (config, terminated, offload) = config_routes(hostnames, upstreams);
+
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
-            local: Arc::new(local),
-            tunnel_hosts: Arc::new(tunnel_hosts),
+            config: Arc::new(RwLock::new(config)),
             terminated: Arc::new(RwLock::new(terminated)),
             offload: Arc::new(RwLock::new(offload)),
         }
     }
 
+    /// Replace the routes of the config. Tunnels keep the routes they hold until
+    /// they reconnect. `Terminated::Replace` also resets the terminated set to
+    /// the config; `Terminated::Extend` adds to it, for the dynamic seam to set
+    /// the rest.
+    pub fn replace_config(
+        &self,
+        hostnames: &[HostnameEntry],
+        upstreams: &[UpstreamEntry],
+        seed: Terminated,
+    ) {
+        let (config, terminated, offload) = config_routes(hostnames, upstreams);
+
+        *self.config.write() = config;
+        *self.offload.write() = offload;
+
+        match seed {
+            Terminated::Replace => *self.terminated.write() = terminated,
+            Terminated::Extend => self.terminated.write().extend(terminated),
+        }
+    }
+}
+
+/// How a config reload changes the terminated set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminated {
+    /// The config holds every terminated hostname (static mode).
+    Replace,
+    /// The dynamic seam sets the hostnames of the backend after the reload.
+    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
+    Extend,
+}
+
+type HostSet = std::collections::HashSet<String>;
+
+/// The routes, terminated set and offload set of a config. Config validation
+/// guarantees each upstream names exactly one target; an entry with neither is
+/// defensively skipped.
+fn config_routes(
+    hostnames: &[HostnameEntry],
+    upstreams: &[UpstreamEntry],
+) -> (ConfigRoutes, HostSet, HostSet) {
+    let local = upstreams
+        .iter()
+        .filter_map(|u| {
+            let target = match (&u.local_socket, u.local_addr) {
+                (Some(path), _) => UpstreamTarget::Unix(path.clone()),
+                (None, Some(addr)) => UpstreamTarget::Tcp(addr),
+                (None, None) => return None,
+            };
+            let upstream = LocalUpstream {
+                target,
+                tls_mode: u.tls_mode,
+            };
+            Some((u.host.to_ascii_lowercase(), upstream))
+        })
+        .collect();
+    // A hostname needs TLS termination (a cert) in both `terminated` and
+    // `tls_offload` mode — they only diverge after the handshake. Seed the
+    // termination set with both, from tunnel routes AND local upstreams.
+    let terminates = |m: TlsMode| matches!(m, TlsMode::Terminated | TlsMode::TlsOffload);
+    let terminated = hostnames
+        .iter()
+        .filter(|h| terminates(h.tls_mode))
+        .map(|h| h.host.to_ascii_lowercase())
+        .chain(
+            upstreams
+                .iter()
+                .filter(|u| terminates(u.tls_mode))
+                .map(|u| u.host.to_ascii_lowercase()),
+        )
+        .collect();
+    // The offload subset: terminate TLS, then byte-pipe plaintext (no HTTP).
+    let offload = hostnames
+        .iter()
+        .filter(|h| h.tls_mode == TlsMode::TlsOffload)
+        .map(|h| h.host.to_ascii_lowercase())
+        .chain(
+            upstreams
+                .iter()
+                .filter(|u| u.tls_mode == TlsMode::TlsOffload)
+                .map(|u| u.host.to_ascii_lowercase()),
+        )
+        .collect();
+    let tunnel_hosts = hostnames
+        .iter()
+        .map(|h| h.host.to_ascii_lowercase())
+        .collect();
+
+    (
+        ConfigRoutes {
+            local,
+            tunnel_hosts,
+        },
+        terminated,
+        offload,
+    )
+}
+
+impl RoutingTable {
     /// Whether the server terminates TLS for `host` (it's in the known set).
     /// True for both HTTP-`terminated` and `tls_offload` hostnames — both hold a
     /// cert and complete the handshake here. Case-insensitive — DNS hostnames
@@ -192,14 +251,15 @@ impl RoutingTable {
     pub fn routes_to_upstream(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
 
-        self.local.contains_key(&host) || self.wildcard_upstream(&host).is_some()
+        self.config.read().local.contains_key(&host) || self.wildcard_upstream(&host).is_some()
     }
 
     /// The `*.domain` or `*` upstream of a lowercase `host` that no exact
     /// entry (upstream, tunnel or provisioned hostname) names.
-    fn wildcard_upstream(&self, host: &str) -> Option<&LocalUpstream> {
-        let exact = self.local.contains_key(host)
-            || self.tunnel_hosts.contains(host)
+    fn wildcard_upstream(&self, host: &str) -> Option<LocalUpstream> {
+        let config = self.config.read();
+        let exact = config.local.contains_key(host)
+            || config.tunnel_hosts.contains(host)
             || self.terminated.read().contains(host)
             || self.inner.read().contains_key(host);
 
@@ -210,16 +270,17 @@ impl RoutingTable {
         host_patterns(host)
             .iter()
             .skip(1)
-            .find_map(|pattern| self.local.get(pattern))
+            .find_map(|pattern| config.local.get(pattern))
+            .cloned()
     }
 
-    /// Replace the whole terminated set. The caller (the dynamic seam) passes the
-    /// full set it knows (config-terminated ∪ backend-provisioned terminated).
     /// The hostnames the server terminates TLS for (config and dynamic seam).
     pub fn terminated_hosts(&self) -> Vec<String> {
         self.terminated.read().iter().cloned().collect()
     }
 
+    /// Replace the whole terminated set. The caller (the dynamic seam) passes the
+    /// full set it knows (config-terminated ∪ backend-provisioned terminated).
     #[cfg(feature = "dynamic")]
     pub fn set_terminated(&self, full: Vec<String>) {
         let mut g = self.terminated.write();
@@ -339,7 +400,7 @@ impl RoutingTable {
         let mut hosts: Vec<String> = guard
             .keys()
             .cloned()
-            .chain(self.local.keys().cloned())
+            .chain(self.config.read().local.keys().cloned())
             .collect();
         hosts.sort();
         hosts.dedup();
@@ -354,10 +415,8 @@ impl RoutingTable {
     pub fn lookup(&self, host: &str) -> Option<Route> {
         let lowercase = host.to_ascii_lowercase();
 
-        let upstream = self
-            .local
-            .get(&lowercase)
-            .or_else(|| self.wildcard_upstream(&lowercase));
+        let exact = self.config.read().local.get(&lowercase).cloned();
+        let upstream = exact.or_else(|| self.wildcard_upstream(&lowercase));
 
         if let Some(up) = upstream {
             return Some(Route::Local {

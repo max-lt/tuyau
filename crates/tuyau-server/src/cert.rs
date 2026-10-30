@@ -49,7 +49,7 @@ pub fn load_chain(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), CertError> {
-    let cert_file = fs::File::open(cert_path)?;
+    let cert_file = open(cert_path)?;
     let mut cert_reader = BufReader::new(cert_file);
     let chain: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_reader).collect::<Result<_, _>>()?;
@@ -57,7 +57,7 @@ pub fn load_chain(
         return Err(CertError::PemNoCert(cert_path.display().to_string()));
     }
 
-    let key_file = fs::File::open(key_path)?;
+    let key_file = open(key_path)?;
     let mut key_reader = BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| CertError::PemNoKey(key_path.display().to_string()))?;
@@ -68,7 +68,7 @@ pub fn load_chain(
 /// Load a PEM bundle of CA certs, e.g. the CA that signs the client certs a
 /// public listener accepts.
 pub fn load_roots(path: &Path) -> Result<rustls::RootCertStore, CertError> {
-    let file = fs::File::open(path)?;
+    let file = open(path)?;
     let mut reader = BufReader::new(file);
     let mut roots = rustls::RootCertStore::empty();
 
@@ -85,8 +85,13 @@ pub fn load_roots(path: &Path) -> Result<rustls::RootCertStore, CertError> {
     Ok(roots)
 }
 
+/// Open `path`, naming it in the error.
+fn open(path: &Path) -> Result<fs::File, CertError> {
+    fs::File::open(path).map_err(|e| CertError::Open(path.display().to_string(), e))
+}
+
 fn read_first_cert(path: &Path) -> Result<CertificateDer<'static>, CertError> {
-    let file = fs::File::open(path)?;
+    let file = open(path)?;
     let mut reader = BufReader::new(file);
     let cert = rustls_pemfile::certs(&mut reader)
         .next()
@@ -96,7 +101,7 @@ fn read_first_cert(path: &Path) -> Result<CertificateDer<'static>, CertError> {
 }
 
 fn read_first_pkcs8_key(path: &Path) -> Result<PrivateKeyDer<'static>, CertError> {
-    let file = fs::File::open(path)?;
+    let file = open(path)?;
     let mut reader = BufReader::new(file);
     let key = rustls_pemfile::pkcs8_private_keys(&mut reader)
         .next()

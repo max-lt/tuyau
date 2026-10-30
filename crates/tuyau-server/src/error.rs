@@ -86,6 +86,9 @@ pub enum CertError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("{0}: {1}")]
+    Open(String, std::io::Error),
+
     #[error("rcgen: {0}")]
     Rcgen(#[from] rcgen::Error),
 

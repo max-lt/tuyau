@@ -24,9 +24,31 @@ enum Cmd {
         /// Path to server.toml.
         #[arg(long)]
         config: PathBuf,
+        /// Check the config (and load its cert files, keys and issuers), then
+        /// exit, as `nginx -t`.
+        #[arg(short = 't', long = "test", conflicts_with = "signal")]
+        test: bool,
+        /// Send a signal to the running server, found by the `pid_file` of the
+        /// config, as `nginx -s`.
+        #[arg(short = 's', long = "signal", value_enum)]
+        signal: Option<Signal>,
     },
     /// Run the tunnel client.
     Client(ClientArgs),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum Signal {
+    /// Load the config again without a restart (SIGHUP).
+    Reload,
+}
+
+/// The keys of server.toml for the process, not for the server.
+#[derive(serde::Deserialize, Default)]
+struct ProcessConfig {
+    /// Where the server writes its PID, for `-s reload`.
+    #[serde(default)]
+    pid_file: Option<PathBuf>,
 }
 
 /// Client config sources. Either `--config <path>` (TOML, for users who want
@@ -70,7 +92,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Server { config } => run_server(&config).await,
+        Cmd::Server { config, test, .. } if test => test_server(&config),
+        Cmd::Server {
+            config,
+            signal: Some(signal),
+            ..
+        } => signal_server(&config, signal),
+        Cmd::Server { config, .. } => run_server(&config).await,
         Cmd::Client(args) => run_client(args).await,
     }
 }
@@ -80,10 +108,11 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-async fn run_server(config_path: &Path) -> Result<()> {
+fn load_config(config_path: &Path) -> Result<(ServerConfig, ProcessConfig)> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading server config at {}", config_path.display()))?;
     let mut cfg = ServerConfig::from_toml_str(&raw).context("parsing server config")?;
+    let process: ProcessConfig = toml::from_str(&raw).context("parsing server config")?;
 
     // Default tunnel_cert_dir to the directory of the --config file so the
     // bootstrap loop (run once to print the fingerprint) is predictable.
@@ -93,11 +122,83 @@ async fn run_server(config_path: &Path) -> Result<()> {
         cfg.tunnel_cert_dir = Some(parent.to_path_buf());
     }
 
+    Ok((cfg, process))
+}
+
+fn test_server(config_path: &Path) -> Result<()> {
+    let (cfg, _) = load_config(config_path)?;
+    TunnelServer::check(&cfg)
+        .with_context(|| format!("configuration file {} test failed", config_path.display()))?;
+
+    println!(
+        "tuyau: configuration file {} test is successful",
+        config_path.display()
+    );
+
+    Ok(())
+}
+
+fn signal_server(config_path: &Path, signal: Signal) -> Result<()> {
+    let (_, process) = load_config(config_path)?;
+    let pid_file = process.pid_file.ok_or_else(|| {
+        anyhow!(
+            "set pid_file in {} to signal the server",
+            config_path.display()
+        )
+    })?;
+    let pid = std::fs::read_to_string(&pid_file)
+        .with_context(|| format!("reading {}", pid_file.display()))?;
+    let pid = pid.trim();
+
+    let name = match signal {
+        Signal::Reload => "HUP",
+    };
+    let status = std::process::Command::new("kill")
+        .args([&format!("-{name}"), pid])
+        .status()
+        .context("running kill")?;
+
+    if !status.success() {
+        return Err(anyhow!("kill -{name} {pid} failed: is the server running?"));
+    }
+
+    Ok(())
+}
+
+async fn run_server(config_path: &Path) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (cfg, process) = load_config(config_path)?;
     let server = TunnelServer::start(cfg).await.context("starting server")?;
     tracing::info!(addr = %server.local_addr()?, "server listening");
 
-    wait_for_shutdown_signal().await;
+    if let Some(pid_file) = &process.pid_file {
+        std::fs::write(pid_file, format!("{}\n", std::process::id()))
+            .with_context(|| format!("writing {}", pid_file.display()))?;
+    }
+
+    let mut hangup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = hangup.recv() => {
+                let reloaded = load_config(config_path).and_then(|(cfg, _)| Ok(server.reload(cfg)?));
+
+                if let Err(e) = reloaded {
+                    tracing::error!(error = %format!("{e:#}"), "reload failed, the config in use stays");
+                }
+            }
+        }
+    }
+
     tracing::info!("shutting down");
+
+    if let Some(pid_file) = &process.pid_file {
+        let _ = std::fs::remove_file(pid_file);
+    }
 
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, server.shutdown()).await;
     Ok(())

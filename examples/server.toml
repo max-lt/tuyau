@@ -18,6 +18,11 @@ public_listen_addr = "0.0.0.0:8443"
 # defaults to the directory of this config file.
 # tunnel_cert_dir = "/var/lib/tuyau"
 
+# Where the server writes its PID, for `tuyau server --config ... -s reload`
+# (SIGHUP: load the routes, cert files and issuers again, no restart).
+# Check a change first with `-t`.
+# pid_file = "/run/tuyau/tuyau.pid"
+
 [[clients]]
 name = "service-a"
 # 32-byte token, 64 lowercase hex chars. Generate with:

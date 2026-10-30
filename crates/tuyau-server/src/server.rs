@@ -19,12 +19,12 @@ use crate::config::ServerConfig;
 use crate::config::{IssuerEntry, TerminatedHost};
 use crate::control::{Control, TunnelInfo};
 use crate::error::ServerError;
-use crate::host_certs::HostCerts;
+use crate::host_certs::{HostCertResolver, HostCerts};
 #[cfg(feature = "dynamic")]
 use crate::issuers::HostIssuer;
-use crate::issuers::Issuers;
+use crate::issuers::{self, Issuers};
 use crate::public;
-use crate::routes::RoutingTable;
+use crate::routes::{RoutingTable, Terminated};
 #[cfg(feature = "dynamic")]
 use std::collections::HashMap;
 
@@ -60,15 +60,52 @@ pub struct TunnelServer {
     public_handle: Option<JoinHandle<()>>,
     // The cert issuers of the public listener. Their ACME tasks are tied to
     // `cancel`, so shutdown stops them without an explicit await.
-    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
     issuers: Option<Arc<Issuers>>,
+    // The certs of the entries with a cert file, before the issuers
+    host_certs: Option<Arc<HostCertResolver>>,
+    mode: Mode,
+    fixed: Fixed,
+}
+
+/// Where the clients and hostnames of the tunnels come from.
+enum Mode {
+    /// The config, which a reload replaces
+    Static(Arc<StaticBackend>),
+    /// The backend of the embedder
+    #[cfg(feature = "dynamic")]
+    Dynamic,
+}
+
+/// The settings that only a restart changes: they open the sockets or build
+/// the TLS config of the public listener.
+#[derive(Debug, Clone, PartialEq)]
+struct Fixed {
+    listen_addr: SocketAddr,
+    public_listen_addr: Option<SocketAddr>,
+    tunnel_cert_dir: Option<PathBuf>,
+    client_ca_file: Option<PathBuf>,
+    error_502_file: Option<PathBuf>,
+    max_public_connections: Option<usize>,
+}
+
+impl Fixed {
+    fn of(config: &ServerConfig) -> Self {
+        Self {
+            listen_addr: config.listen_addr,
+            public_listen_addr: config.public_listen_addr,
+            tunnel_cert_dir: config.tunnel_cert_dir.clone(),
+            client_ca_file: config.client_ca_file.clone(),
+            error_502_file: config.error_502_file.clone(),
+            max_public_connections: config.max_public_connections,
+        }
+    }
 }
 
 impl TunnelServer {
     pub async fn start(config: ServerConfig) -> Result<Self, ServerError> {
         config.validate()?;
-        let backend: Arc<dyn RoutingBackend> = Arc::new(StaticBackend::new(&config));
-        Self::start_inner(backend, config).await
+        let backend = Arc::new(StaticBackend::new(&config));
+        Self::start_inner(backend.clone(), Mode::Static(backend), config).await
     }
 
     /// Start with a caller-provided [`RoutingBackend`] instead of the static
@@ -81,11 +118,88 @@ impl TunnelServer {
         config: ServerConfig,
     ) -> Result<Self, ServerError> {
         config.validate_dynamic()?;
-        Self::start_inner(backend, config).await
+        Self::start_inner(backend, Mode::Dynamic, config).await
+    }
+
+    /// Check `config` as a start would: validate it, and load its cert files,
+    /// keys and issuers. Opens no socket and orders no cert.
+    pub fn check(config: &ServerConfig) -> Result<(), ServerError> {
+        config.validate()?;
+        check_files(config)
+    }
+
+    /// [`TunnelServer::check`] for a config given to
+    /// [`TunnelServer::start_with`]. Behind the `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn check_dynamic(config: &ServerConfig) -> Result<(), ServerError> {
+        config.validate_dynamic()?;
+        check_files(config)
+    }
+
+    /// Serve `config` without a restart: the routes, the cert files of the
+    /// entries, the issuers and, in static mode, the clients and hostnames.
+    /// Everything loads first, so an error changes nothing. A connected tunnel
+    /// keeps its routes until it reconnects. The listen addresses, the tunnel
+    /// cert, `client_ca_file`, `error_502_file` and `max_public_connections`
+    /// need a restart: a change to them is logged and left out. In dynamic
+    /// mode, call [`TunnelServer::set_terminated_domains`] after it.
+    pub fn reload(&self, config: ServerConfig) -> Result<(), ServerError> {
+        let (static_backend, seed) = match &self.mode {
+            Mode::Static(backend) => {
+                config.validate()?;
+                (Some(backend), Terminated::Replace)
+            }
+            #[cfg(feature = "dynamic")]
+            Mode::Dynamic => {
+                config.validate_dynamic()?;
+                (None, Terminated::Extend)
+            }
+        };
+
+        let host_certs = match &self.host_certs {
+            Some(_) => Some(HostCerts::load(&config)?),
+            None => None,
+        };
+        let prepared = match &self.issuers {
+            Some(issuers) => Some(issuers.prepare(config.effective_issuers())?),
+            None => None,
+        };
+
+        if Fixed::of(&config) != self.fixed {
+            tracing::warn!(
+                "reload leaves out listen_addr, public_listen_addr, tunnel_cert_dir, \
+                 client_ca_file, error_502_file and max_public_connections: they need a restart"
+            );
+        }
+
+        if let Some(backend) = static_backend {
+            backend.replace(&config);
+        }
+
+        self.routes
+            .replace_config(&config.hostnames, &config.upstreams, seed);
+
+        if let (Some(resolver), Some(certs)) = (&self.host_certs, host_certs) {
+            resolver.replace(certs);
+        }
+
+        if let (Some(issuers), Some(prepared)) = (&self.issuers, prepared) {
+            issuers.reload(&config, prepared);
+            issuers.plan_acme(&self.routes.terminated_hosts());
+        }
+
+        tracing::info!(
+            upstreams = config.upstreams.len(),
+            hostnames = config.hostnames.len(),
+            "config reloaded"
+        );
+
+        Ok(())
     }
 
     async fn start_inner(
         backend: Arc<dyn RoutingBackend>,
+        mode: Mode,
         config: ServerConfig,
     ) -> Result<Self, ServerError> {
         let cert_dir = resolve_cert_dir(&config.tunnel_cert_dir);
@@ -111,7 +225,7 @@ impl TunnelServer {
 
         // Optional public listener, only spawned if configured. A host with a
         // cert file serves it; the others take the cert of their issuer.
-        let (public_addr, public_handle, issuers) = match config.public_listen_addr {
+        let (public_addr, public_handle, issuers, host_certs) = match config.public_listen_addr {
             Some(addr) => {
                 let host_certs = HostCerts::load(&config)?;
                 let issuers = Arc::new(Issuers::new(&config, cancel.clone())?);
@@ -119,6 +233,7 @@ impl TunnelServer {
                 issuers.plan_acme(&terminated);
 
                 let resolver = host_certs.resolver(issuers.clone());
+                let host_certs = resolver.clone();
                 let client_cert = match &config.client_ca_file {
                     Some(path) => public::ClientCert::SignedBy(Arc::new(cert::load_roots(path)?)),
                     None => public::ClientCert::Any,
@@ -158,9 +273,14 @@ impl TunnelServer {
                     terminated_hostnames = terminated.len(),
                     "public TLS listener active"
                 );
-                (Some(handle.local_addr), Some(handle.join), Some(issuers))
+                (
+                    Some(handle.local_addr),
+                    Some(handle.join),
+                    Some(issuers),
+                    Some(host_certs),
+                )
             }
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
 
         let control = Control::new();
@@ -190,6 +310,9 @@ impl TunnelServer {
             accept_handle,
             public_handle,
             issuers,
+            host_certs,
+            mode,
+            fixed: Fixed::of(&config),
         })
     }
 
@@ -324,6 +447,18 @@ impl TunnelServer {
         drop(self.issuers);
         self.endpoint.wait_idle().await;
     }
+}
+
+/// Load the files that `config` names, as a start would, and drop them.
+fn check_files(config: &ServerConfig) -> Result<(), ServerError> {
+    HostCerts::load(config)?;
+    issuers::check(&config.effective_issuers())?;
+
+    if let Some(path) = &config.client_ca_file {
+        cert::load_roots(path)?;
+    }
+
+    Ok(())
 }
 
 fn resolve_cert_dir(configured: &Option<PathBuf>) -> PathBuf {

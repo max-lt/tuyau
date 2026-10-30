@@ -5,6 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 // Non-poisoning locks on the handshake path, as in routes.rs
 use parking_lot::{Mutex, RwLock};
 
@@ -23,25 +25,54 @@ pub(crate) struct Issuers {
     state: RwLock<State>,
     /// For a hostname without an issuer, and for an ACME name without a cert
     fallback: OnDemand,
-    /// Hosts and patterns of the entries with a cert file: that cert wins, so
-    /// ACME orders none for them
-    own_certs: HashSet<String>,
     cancel: CancellationToken,
 }
 
 struct State {
     issuers: HashMap<String, Arc<Issuer>>,
     default: Option<String>,
-    /// Lowercase host or pattern of a config entry, to its issuer
-    config_hosts: HashMap<String, String>,
+    config: ConfigIssuers,
     /// Lowercase host provisioned through the dynamic seam, to its issuer
     dynamic_hosts: HashMap<String, String>,
+}
+
+/// What the config says about the certs of its entries.
+struct ConfigIssuers {
+    /// Lowercase host or pattern of an entry, to its issuer
+    hosts: HashMap<String, String>,
+    /// Hosts and patterns of the entries with a cert file: that cert wins, so
+    /// ACME orders none for them
+    own_certs: HashSet<String>,
+}
+
+impl ConfigIssuers {
+    fn of(config: &ServerConfig) -> Self {
+        let hosts = config
+            .host_issuers()
+            .map(|(host, _, _, issuer)| (host.to_ascii_lowercase(), issuer.to_string()))
+            .collect();
+        let own_certs = config
+            .host_certs()
+            .filter(|(_, _, cert, _)| cert.is_some())
+            .map(|(host, _, _, _)| host.to_ascii_lowercase())
+            .collect();
+
+        Self { hosts, own_certs }
+    }
+}
+
+/// A loaded issuer list, ready to replace the current one.
+pub(crate) struct Prepared {
+    issuers: HashMap<String, Arc<Issuer>>,
+    default: Option<String>,
 }
 
 struct Issuer {
     entry: IssuerEntry,
     source: Source,
     coverage: Coverage,
+    /// Digest of its cert and key files, for a `local_ca` or `imported` issuer
+    files: Option<[u8; 32]>,
 }
 
 /// How a hostname got its issuer.
@@ -106,25 +137,14 @@ impl Issuers {
         config: &ServerConfig,
         cancel: CancellationToken,
     ) -> Result<Self, ServerError> {
-        let config_hosts = config
-            .host_issuers()
-            .map(|(host, _, _, issuer)| (host.to_ascii_lowercase(), issuer.to_string()))
-            .collect();
-        let own_certs = config
-            .host_certs()
-            .filter(|(_, _, cert, _)| cert.is_some())
-            .map(|(host, _, _, _)| host.to_ascii_lowercase())
-            .collect();
-
         let issuers = Self {
             state: RwLock::new(State {
                 issuers: HashMap::new(),
                 default: None,
-                config_hosts,
+                config: ConfigIssuers::of(config),
                 dynamic_hosts: HashMap::new(),
             }),
             fallback: OnDemand::self_signed(),
-            own_certs,
             cancel,
         };
         issuers.set_issuers(config.effective_issuers())?;
@@ -132,9 +152,9 @@ impl Issuers {
         Ok(issuers)
     }
 
-    /// Replace the issuers. An issuer with the same entry as before keeps its
-    /// certs; a failed load changes nothing.
-    pub(crate) fn set_issuers(&self, entries: Vec<IssuerEntry>) -> Result<(), ServerError> {
+    /// Load `entries` without serving them. An issuer whose entry and files
+    /// did not change keeps its certs and orders.
+    pub(crate) fn prepare(&self, entries: Vec<IssuerEntry>) -> Result<Prepared, ServerError> {
         validate_issuer_list(&entries)?;
 
         let current = self.state.read().issuers.clone();
@@ -142,7 +162,11 @@ impl Issuers {
 
         for entry in entries {
             let issuer = match current.get(&entry.name) {
-                Some(issuer) if issuer.entry == entry => issuer.clone(),
+                Some(issuer)
+                    if issuer.entry == entry && issuer.files == files_digest(&entry.kind) =>
+                {
+                    issuer.clone()
+                }
                 _ => Arc::new(Issuer::load(entry)?),
             };
 
@@ -154,13 +178,26 @@ impl Issuers {
             .find(|i| i.entry.default)
             .map(|i| i.entry.name.clone());
 
-        tracing::info!(issuers = issuers.len(), default = ?default, "cert issuers set");
+        Ok(Prepared { issuers, default })
+    }
 
+    /// Replace the issuers; a failed load changes nothing.
+    pub(crate) fn set_issuers(&self, entries: Vec<IssuerEntry>) -> Result<(), ServerError> {
+        let prepared = self.prepare(entries)?;
         let mut state = self.state.write();
-        state.issuers = issuers;
-        state.default = default;
+
+        state.install(prepared);
 
         Ok(())
+    }
+
+    /// Serve the issuers of a reloaded config: `prepared`, and the issuers and
+    /// cert files its entries name.
+    pub(crate) fn reload(&self, config: &ServerConfig, prepared: Prepared) {
+        let mut state = self.state.write();
+
+        state.config = ConfigIssuers::of(config);
+        state.install(prepared);
     }
 
     /// Replace the issuer names of the hostnames provisioned through the seam.
@@ -196,7 +233,7 @@ impl Issuers {
             let host = host.to_ascii_lowercase();
             let own_cert = host_patterns(&host)
                 .iter()
-                .any(|pattern| self.own_certs.contains(pattern));
+                .any(|pattern| state.config.own_certs.contains(pattern));
 
             if host.contains('*') || own_cert {
                 continue;
@@ -241,6 +278,17 @@ impl Issuers {
 }
 
 impl State {
+    fn install(&mut self, prepared: Prepared) {
+        tracing::info!(
+            issuers = prepared.issuers.len(),
+            default = ?prepared.default,
+            "cert issuers set"
+        );
+
+        self.issuers = prepared.issuers;
+        self.default = prepared.default;
+    }
+
     /// The issuer of `host`: the one of its exact entry, of its `*.domain`
     /// entry or of `*` (as the routing table picks the entry), else the one
     /// that covers it most closely, else the default.
@@ -249,7 +297,7 @@ impl State {
             .iter()
             .enumerate()
             .find_map(|(i, pattern)| {
-                let config = self.config_hosts.get(pattern);
+                let config = self.config.hosts.get(pattern);
 
                 match i {
                     0 => config.or_else(|| self.dynamic_hosts.get(pattern)),
@@ -281,8 +329,42 @@ impl State {
     }
 }
 
+/// Load `entries` as a start would, and drop them. Orders no cert.
+pub(crate) fn check(entries: &[IssuerEntry]) -> Result<(), ServerError> {
+    validate_issuer_list(entries)?;
+
+    for entry in entries {
+        Issuer::load(entry.clone())?;
+    }
+
+    Ok(())
+}
+
+/// The digest of the cert and key files of a `local_ca` or `imported` issuer,
+/// so a renewed file loads again under the same entry.
+fn files_digest(kind: &IssuerKind) -> Option<[u8; 32]> {
+    let (IssuerKind::LocalCa {
+        cert_file,
+        key_file,
+    }
+    | IssuerKind::Imported {
+        cert_file,
+        key_file,
+    }) = kind
+    else {
+        return None;
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(cert_file).ok()?);
+    hasher.update(std::fs::read(key_file).ok()?);
+
+    Some(hasher.finalize().into())
+}
+
 impl Issuer {
     fn load(entry: IssuerEntry) -> Result<Self, ServerError> {
+        let files = files_digest(&entry.kind);
         let (source, coverage) = match &entry.kind {
             IssuerKind::LocalCa {
                 cert_file,
@@ -326,6 +408,7 @@ impl Issuer {
             entry,
             source,
             coverage,
+            files,
         })
     }
 }
