@@ -4,6 +4,7 @@ mod backend;
 mod cert;
 mod config;
 mod control;
+mod coverage;
 mod error;
 mod h2proxy;
 mod host_certs;
@@ -21,6 +22,7 @@ pub use config::{
     TerminatedHost, TlsMode, UpstreamEntry,
 };
 pub use error::{CertError, ConfigError, ServerError};
+pub use issuers::{HostIssuer, IssuerChoice};
 pub use server::TunnelServer;
 
 /// Dynamic routing seam: implement [`RoutingBackend`] and inject it via

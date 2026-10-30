@@ -20,9 +20,13 @@ use crate::config::{IssuerEntry, TerminatedHost};
 use crate::control::{Control, TunnelInfo};
 use crate::error::ServerError;
 use crate::host_certs::HostCerts;
+#[cfg(feature = "dynamic")]
+use crate::issuers::HostIssuer;
 use crate::issuers::Issuers;
 use crate::public;
 use crate::routes::RoutingTable;
+#[cfg(feature = "dynamic")]
+use std::collections::HashMap;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 // Tunnel liveness. A silently-dead tunnel (killed process, severed network) is
@@ -274,6 +278,23 @@ impl TunnelServer {
             cert_issuers.set_dynamic_hosts(issuers);
             cert_issuers.plan_acme(&self.routes.terminated_hosts());
         }
+    }
+
+    /// The issuer of a terminated hostname and how it got it; `None` takes a
+    /// self-signed cert. Behind the `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn host_issuer(&self, host: &str) -> Option<HostIssuer> {
+        self.issuers.as_ref()?.host_issuer(host)
+    }
+
+    /// The names that each issuer covers by itself, as an operator reads them
+    /// (e.g. `.home.lan`, `*.example.com`). Behind the `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn issuer_coverage(&self) -> HashMap<String, Vec<String>> {
+        self.issuers
+            .as_ref()
+            .map(|issuers| issuers.coverage())
+            .unwrap_or_default()
     }
 
     /// Replace the cert issuers. An issuer whose entry did not change keeps its

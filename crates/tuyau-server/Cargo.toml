@@ -19,6 +19,8 @@ tokio-rustls = { workspace = true }
 rustls-acme = { workspace = true }
 rcgen = { workspace = true }
 time = { workspace = true }
+# Read the SANs of an imported cert, to know the names it covers
+x509-parser = "0.16"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
@@ -38,4 +40,3 @@ http-body-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-x509-parser = "0.16"

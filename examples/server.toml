@@ -114,8 +114,9 @@ tls_mode = "passthrough"
 # tls_key_file  = "/etc/tuyau/example.org.key"
 
 # Cert issuers: the cert source of each terminated hostname. An entry names
-# one with `issuer = "..."`; the others take the issuer with `default = true`,
-# else a self-signed cert. Kinds:
+# one with `issuer = "..."`; the others take the issuer whose cert covers them
+# (the DNS name constraints of a CA, the SANs of an imported cert; the closest
+# wins), else the issuer with `default = true`, else a self-signed cert. Kinds:
 #   local_ca    a CA of your own that the clients trust; the server signs a
 #               cert for each hostname at its first handshake. The key must be
 #               PKCS#8 ("BEGIN PRIVATE KEY"): convert a SEC1 key with

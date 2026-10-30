@@ -1,5 +1,6 @@
 //! The issuers of the certs of terminated hostnames, and the issuer of each
-//! hostname: the one it names, else the default one, else a self-signed cert.
+//! hostname: the one it names, else the one whose cert covers it, else the
+//! default one, else a self-signed cert.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cert;
 use crate::config::{AcmeSection, IssuerEntry, IssuerKind, ServerConfig, validate_issuer_list};
+use crate::coverage::Coverage;
 use crate::error::ServerError;
 use crate::on_demand::OnDemand;
 use crate::routes::host_patterns;
@@ -39,6 +41,26 @@ struct State {
 struct Issuer {
     entry: IssuerEntry,
     source: Source,
+    coverage: Coverage,
+}
+
+/// How a hostname got its issuer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuerChoice {
+    /// Its entry names the issuer.
+    Named,
+    /// The cert of the issuer covers the hostname: the name constraints of a
+    /// CA, or the SANs of an imported cert.
+    Covered,
+    /// The default issuer.
+    Default,
+}
+
+/// The issuer of a hostname, and how it got it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIssuer {
+    pub issuer: String,
+    pub choice: IssuerChoice,
 }
 
 enum Source {
@@ -180,7 +202,7 @@ impl Issuers {
                 continue;
             }
 
-            let Some(issuer) = state.issuer_of(&host) else {
+            let Some((issuer, _)) = state.issuer_of(&host) else {
                 continue;
             };
 
@@ -193,12 +215,36 @@ impl Issuers {
 
         plan
     }
+
+    /// The issuer of `host` and how it got it; `None` takes a self-signed cert.
+    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
+    pub(crate) fn host_issuer(&self, host: &str) -> Option<HostIssuer> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let (issuer, choice) = self.state.read().issuer_of(&host)?;
+
+        Some(HostIssuer {
+            issuer: issuer.entry.name.clone(),
+            choice,
+        })
+    }
+
+    /// The names that each issuer covers, as an operator reads them.
+    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
+    pub(crate) fn coverage(&self) -> HashMap<String, Vec<String>> {
+        self.state
+            .read()
+            .issuers
+            .values()
+            .map(|i| (i.entry.name.clone(), i.coverage.describe()))
+            .collect()
+    }
 }
 
 impl State {
     /// The issuer of `host`: the one of its exact entry, of its `*.domain`
-    /// entry or of `*`, as the routing table picks the entry, else the default.
-    fn issuer_of(&self, host: &str) -> Option<Arc<Issuer>> {
+    /// entry or of `*` (as the routing table picks the entry), else the one
+    /// that covers it most closely, else the default.
+    fn issuer_of(&self, host: &str) -> Option<(Arc<Issuer>, IssuerChoice)> {
         let named = host_patterns(host)
             .iter()
             .enumerate()
@@ -211,46 +257,76 @@ impl State {
                 }
             });
 
-        let name = named.or(self.default.as_ref())?;
-
-        match self.issuers.get(name) {
-            Some(issuer) => Some(issuer.clone()),
-            None => {
-                tracing::warn!(host = %host, issuer = %name, "unknown cert issuer");
-                self.default
-                    .as_ref()
-                    .and_then(|d| self.issuers.get(d))
-                    .cloned()
+        if let Some(name) = named {
+            match self.issuers.get(name) {
+                Some(issuer) => return Some((issuer.clone(), IssuerChoice::Named)),
+                None => tracing::warn!(host = %host, issuer = %name, "unknown cert issuer"),
             }
         }
+
+        // The name breaks a tie, so the choice does not depend on map order
+        let covered = self
+            .issuers
+            .values()
+            .filter_map(|issuer| Some((issuer.coverage.score(host)?, issuer)))
+            .max_by(|(a, x), (b, y)| a.cmp(b).then_with(|| y.entry.name.cmp(&x.entry.name)));
+
+        if let Some((_, issuer)) = covered {
+            return Some((issuer.clone(), IssuerChoice::Covered));
+        }
+
+        let default = self.issuers.get(self.default.as_ref()?)?;
+
+        Some((default.clone(), IssuerChoice::Default))
     }
 }
 
 impl Issuer {
     fn load(entry: IssuerEntry) -> Result<Self, ServerError> {
-        let source = match &entry.kind {
+        let (source, coverage) = match &entry.kind {
             IssuerKind::LocalCa {
                 cert_file,
                 key_file,
-            } => Source::OnDemand(OnDemand::local_ca(cert_file, key_file)?),
-            IssuerKind::SelfSigned => Source::OnDemand(OnDemand::self_signed()),
+            } => {
+                let local_ca = OnDemand::local_ca(cert_file, key_file)?;
+                let coverage = local_ca.coverage();
+                (Source::OnDemand(local_ca), coverage)
+            }
+            IssuerKind::SelfSigned => (
+                Source::OnDemand(OnDemand::self_signed()),
+                Coverage::default(),
+            ),
             IssuerKind::Imported {
                 cert_file,
                 key_file,
             } => {
                 let (chain, key) = cert::load_chain(cert_file, key_file)?;
+                let coverage = Coverage::from_sans(&chain[0]);
                 let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)?;
-                Source::Imported(Arc::new(CertifiedKey::new(chain, signing_key)))
+                let certified = Arc::new(CertifiedKey::new(chain, signing_key));
+                (Source::Imported(certified), coverage)
             }
-            IssuerKind::Acme(section) => Source::Acme(Acme {
-                section: section.clone(),
-                names: Mutex::new(HashMap::new()),
-            }),
+            IssuerKind::Acme(section) => {
+                let acme = Acme {
+                    section: section.clone(),
+                    names: Mutex::new(HashMap::new()),
+                };
+                (Source::Acme(acme), Coverage::default())
+            }
         };
 
-        tracing::info!(issuer = %entry.name, kind = ?entry.kind, "cert issuer loaded");
+        tracing::info!(
+            issuer = %entry.name,
+            kind = ?entry.kind,
+            covers = ?coverage.describe(),
+            "cert issuer loaded"
+        );
 
-        Ok(Self { entry, source })
+        Ok(Self {
+            entry,
+            source,
+            coverage,
+        })
     }
 }
 
@@ -319,7 +395,7 @@ impl ResolvesServerCert for Issuers {
         let host = ch.server_name()?.trim_end_matches('.').to_ascii_lowercase();
         let issuer = self.state.read().issuer_of(&host);
 
-        let Some(issuer) = issuer else {
+        let Some((issuer, _)) = issuer else {
             return self.fallback.cert_for(&host);
         };
 
@@ -380,11 +456,7 @@ mod tests {
     "#;
 
     fn issuer_name(issuers: &Issuers, host: &str) -> Option<String> {
-        issuers
-            .state
-            .read()
-            .issuer_of(host)
-            .map(|i| i.entry.name.clone())
+        issuers.host_issuer(host).map(|h| h.issuer)
     }
 
     #[test]
@@ -494,5 +566,119 @@ mod tests {
         assert!(issuers.set_issuers(vec![missing]).is_err());
         assert_eq!(issuers.state.read().issuers.len(), 2);
         assert_eq!(issuers.state.read().default.as_deref(), Some("dev"));
+    }
+
+    /// Writes a CA limited to `permitted` names into `dir`; gives its config
+    /// lines as a `local_ca` issuer named `name`.
+    fn ca_issuer(dir: &std::path::Path, name: &str, permitted: &str) -> String {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName(permitted.into())],
+            excluded_subtrees: vec![],
+        });
+        let ca = params.self_signed(&key).unwrap();
+
+        let cert_file = dir.join(format!("{name}.pem"));
+        let key_file = dir.join(format!("{name}.key"));
+        std::fs::write(&cert_file, ca.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+
+        format!(
+            "[[issuers]]\nname = \"{name}\"\nkind = \"local_ca\"\n\
+             cert_file = \"{}\"\nkey_file = \"{}\"\n",
+            cert_file.display(),
+            key_file.display()
+        )
+    }
+
+    fn covered_config(dir: &std::path::Path) -> Issuers {
+        issuers(&format!(
+            r#"
+            listen_addr = "127.0.0.1:0"
+            {home}
+            {wide}
+            [[issuers]]
+            name = "le"
+            kind = "acme"
+            contact = "mailto:ops@example.com"
+            cache_dir = "/tmp/tuyau-acme-test"
+            default = true
+
+            [[issuers]]
+            name = "dev"
+            kind = "self_signed"
+
+            [[upstreams]]
+            host = "*.lan.example.com"
+            local_addr = "127.0.0.1:1"
+
+            [[upstreams]]
+            host = "named.lan.example.com"
+            local_addr = "127.0.0.1:1"
+            issuer = "dev"
+            "#,
+            home = ca_issuer(dir, "home", "lan.example.com"),
+            wide = ca_issuer(dir, "wide", "example.net"),
+        ))
+    }
+
+    #[test]
+    fn a_host_takes_the_issuer_that_covers_it_unless_its_entry_names_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let issuers = covered_config(dir.path());
+        let issuer = |host: &str| issuers.host_issuer(host).unwrap();
+
+        assert_eq!(
+            issuer("nas.lan.example.com"),
+            HostIssuer {
+                issuer: "home".into(),
+                choice: IssuerChoice::Covered
+            }
+        );
+        assert_eq!(issuer("named.lan.example.com").choice, IssuerChoice::Named);
+        assert_eq!(
+            issuer("public.example.com"),
+            HostIssuer {
+                issuer: "le".into(),
+                choice: IssuerChoice::Default
+            }
+        );
+        assert_eq!(issuers.coverage()["home"], ["lan.example.com"]);
+        assert!(issuers.coverage()["le"].is_empty());
+    }
+
+    #[test]
+    fn the_issuer_with_the_narrower_cover_wins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let issuers = issuers(&format!(
+            "listen_addr = \"127.0.0.1:0\"\n{}\n{}\n\
+             [[upstreams]]\nhost = \"a.example.com\"\nlocal_addr = \"127.0.0.1:1\"\n",
+            ca_issuer(dir.path(), "wide", "example.com"),
+            ca_issuer(dir.path(), "narrow", "lan.example.com"),
+        ));
+
+        assert_eq!(
+            issuer_name(&issuers, "nas.lan.example.com").as_deref(),
+            Some("narrow")
+        );
+        assert_eq!(
+            issuer_name(&issuers, "www.example.com").as_deref(),
+            Some("wide")
+        );
+    }
+
+    #[test]
+    fn acme_orders_no_cert_for_a_name_that_a_ca_covers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let issuers = covered_config(dir.path());
+
+        let plan = issuers.acme_plan(&["public.example.com".into(), "nas.lan.example.com".into()]);
+
+        assert_eq!(
+            plan.get("le"),
+            Some(&HashSet::from(["public.example.com".to_string()]))
+        );
     }
 }

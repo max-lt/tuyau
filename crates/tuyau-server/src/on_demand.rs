@@ -16,6 +16,7 @@ use rustls::sign::CertifiedKey;
 use time::OffsetDateTime;
 
 use crate::cert;
+use crate::coverage::Coverage;
 use crate::error::CertError;
 
 /// Validity of an issued cert. macOS refuses a server cert valid for more than
@@ -89,6 +90,16 @@ impl OnDemand {
             ca: Some(Box::new(Ca { cert, key })),
             issued: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The names that the CA may sign; none for a self-signed issuer.
+    pub(crate) fn coverage(&self) -> Coverage {
+        let constraints = self
+            .ca
+            .as_ref()
+            .and_then(|ca| ca.cert.params().name_constraints.as_ref());
+
+        Coverage::from_constraints(constraints)
     }
 
     /// The cert of `host`, issued now if it has none or if it nears its end.

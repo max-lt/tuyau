@@ -62,11 +62,13 @@ a local service.
   the server-wide cert.
 - **Cert issuers**: list `[[issuers]]` (`local_ca`, `acme`, `imported`,
   `self_signed`), mark one `default = true`, and name one with `issuer` on a
-  `[[hostnames]]` or `[[upstreams]]` entry; the others take the default. A
+  `[[hostnames]]` or `[[upstreams]]` entry. A hostname without a named issuer
+  takes the issuer whose cert covers it (the DNS name constraints of a CA, the
+  SANs of an imported cert; the closest wins), else the default. A
   `local_ca` issuer (a CA of your own that the clients trust) signs a cert
   for each hostname at its first handshake: no challenge, no file to renew.
-  E.g. `example.com` from Let's Encrypt and `*.home.lan` from the home CA on
-  the same 443. With the `dynamic` feature, `set_issuers` replaces the list at
+  E.g. Let's Encrypt as the default and a home CA limited to `home.lan`: every
+  `*.home.lan` name takes the home CA, with nothing to name. With the `dynamic` feature, `set_issuers` replaces the list at
   runtime. `[acme]` and `tls_cert_file` stay as the short form of one default
   issuer.
 - **Client cert check**: `client_ca_file` makes the hosts tuyau terminates
