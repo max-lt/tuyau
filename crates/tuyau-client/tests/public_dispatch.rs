@@ -39,7 +39,7 @@ async fn spin_up_with_public(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
@@ -141,6 +141,7 @@ async fn public_tls_dispatches_bytes_through_tunnel() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -191,6 +192,7 @@ async fn public_tls_with_unknown_sni_is_dropped() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -300,6 +302,7 @@ async fn public_tls_passthrough_forwards_raw_tls() {
         tls_mode: TlsMode::Passthrough,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -355,7 +358,7 @@ async fn local_upstream_passthrough_forwards_to_local_service() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
         clients: vec![], // front-only: no tunnel clients
         hostnames: vec![],
         upstreams: vec![UpstreamEntry {
@@ -365,6 +368,7 @@ async fn local_upstream_passthrough_forwards_to_local_service() {
             tls_mode: TlsMode::Passthrough,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         }],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
@@ -445,7 +449,7 @@ async fn local_upstream_unix_socket_terminated_forwards_to_service() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
         clients: vec![],
         hostnames: vec![],
         upstreams: vec![UpstreamEntry {
@@ -455,6 +459,7 @@ async fn local_upstream_unix_socket_terminated_forwards_to_service() {
             tls_mode: TlsMode::Terminated,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         }],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
@@ -528,6 +533,7 @@ async fn end_to_end_http_request_through_tunnel() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -588,6 +594,7 @@ async fn tunnel_listener_yields_connection_with_metadata() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -641,6 +648,7 @@ async fn axum_serves_through_tunnel_listener() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -717,6 +725,7 @@ async fn serve_handles_multiple_sequential_requests() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -761,6 +770,7 @@ async fn serve_handles_concurrent_public_connections() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 
@@ -820,7 +830,7 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
         upstreams: vec![],
         clients: vec![
             ClientEntry {
@@ -841,6 +851,7 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
                 tls_mode: TlsMode::Terminated,
                 tls_cert_file: None,
                 tls_key_file: None,
+                issuer: None,
             },
             HostnameEntry {
                 host: "beta.example.com".into(),
@@ -848,6 +859,7 @@ async fn multi_client_routing_keeps_hostnames_isolated() {
                 tls_mode: TlsMode::Terminated,
                 tls_cert_file: None,
                 tls_key_file: None,
+                issuer: None,
             },
         ],
     };
@@ -923,7 +935,7 @@ async fn round_robin_spreads_public_connections_across_tunnels() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),
@@ -936,6 +948,7 @@ async fn round_robin_spreads_public_connections_across_tunnels() {
             tls_mode: TlsMode::Terminated,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         }],
     };
     let server = TunnelServer::start(server_cfg).await.unwrap();
@@ -983,6 +996,7 @@ async fn large_payload_roundtrips_through_tunnel() {
         tls_mode: TlsMode::Terminated,
         tls_cert_file: None,
         tls_key_file: None,
+        issuer: None,
     }])
     .await;
 

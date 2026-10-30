@@ -1,5 +1,5 @@
 //! End-to-end TLS of the public listener: the cert an entry sets, wildcard and
-//! catch-all routes, the certs of a local CA, and the client certs it accepts.
+//! catch-all routes, the issuers of the certs, and the client certs it accepts.
 
 use std::sync::Arc;
 
@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
-use tuyau_server::{LocalCaSection, ServerConfig, TlsMode, TunnelServer, UpstreamEntry};
+use tuyau_server::{IssuerEntry, IssuerKind, ServerConfig, TlsMode, TunnelServer, UpstreamEntry};
 
 /// rustls client verifier that accepts any cert: the test reads the cert the
 /// server presents, it does not validate it.
@@ -85,6 +85,7 @@ fn upstream(
         tls_mode,
         tls_cert_file: cert.map(|(cert, _)| cert.to_path_buf()),
         tls_key_file: cert.map(|(_, key)| key.to_path_buf()),
+        issuer: None,
     }
 }
 
@@ -126,7 +127,7 @@ async fn a_hostname_with_its_own_cert_presents_it_and_the_others_get_the_default
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
@@ -231,7 +232,7 @@ async fn the_catch_all_passes_unknown_hosts_through_and_a_wildcard_serves_its_ce
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
@@ -365,7 +366,7 @@ async fn a_terminated_host_accepts_only_client_certs_signed_by_the_client_ca() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: Some(ca_file),
-        local_ca: None,
+        issuers: vec![],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
@@ -412,7 +413,7 @@ async fn a_client_ca_file_without_a_cert_stops_the_start() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: Some(empty),
-        local_ca: None,
+        issuers: vec![],
     };
 
     assert!(TunnelServer::start(cfg).await.is_err());
@@ -581,7 +582,7 @@ async fn start_terminated(
         max_public_connections: None,
         error_502_file: None,
         client_ca_file,
-        local_ca: None,
+        issuers: vec![],
     };
 
     TunnelServer::start(cfg).await.unwrap()
@@ -746,7 +747,7 @@ async fn echoes_trusting(
 }
 
 #[tokio::test]
-async fn a_local_ca_signs_the_cert_of_each_terminated_host_without_its_own() {
+async fn each_terminated_host_gets_the_cert_of_its_issuer() {
     let dir = tempfile::TempDir::new().unwrap();
 
     let ca_key = rcgen::KeyPair::generate().unwrap();
@@ -756,15 +757,14 @@ async fn a_local_ca_signs_the_cert_of_each_terminated_host_without_its_own() {
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test authority");
     let ca = ca_params.self_signed(&ca_key).unwrap();
-    let local_ca = LocalCaSection {
-        cert_file: dir.path().join("ca.pem"),
-        key_file: dir.path().join("ca.key"),
-    };
-    std::fs::write(&local_ca.cert_file, ca.pem()).unwrap();
-    std::fs::write(&local_ca.key_file, ca_key.serialize_pem()).unwrap();
+    let (ca_file, ca_key_file) = (dir.path().join("ca.pem"), dir.path().join("ca.key"));
+    std::fs::write(&ca_file, ca.pem()).unwrap();
+    std::fs::write(&ca_key_file, ca_key.serialize_pem()).unwrap();
 
     let (own_cert, own_der, own_key) = write_cert(dir.path(), "own", "own.test");
     let echo = spawn_echo().await;
+    let mut dev = upstream("dev.test", echo, TlsMode::TlsOffload, None);
+    dev.issuer = Some("dev".into());
 
     let cfg = ServerConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -784,19 +784,40 @@ async fn a_local_ca_signs_the_cert_of_each_terminated_host_without_its_own() {
                 TlsMode::TlsOffload,
                 Some((&own_cert, &own_key)),
             ),
+            dev,
         ],
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: Some(local_ca),
+        issuers: vec![
+            IssuerEntry {
+                name: "home".into(),
+                default: true,
+                kind: IssuerKind::LocalCa {
+                    cert_file: ca_file,
+                    key_file: ca_key_file,
+                },
+            },
+            IssuerEntry {
+                name: "dev".into(),
+                default: false,
+                kind: IssuerKind::SelfSigned,
+            },
+        ],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
 
+    // The default issuer, also under a wildcard route
     assert!(echoes_trusting(public, "app.test", ca.der()).await);
     assert!(echoes_trusting(public, "a.wild.test", ca.der()).await);
 
-    // The cert of an entry wins over the local CA
+    // The issuer an entry names
+    assert!(!echoes_trusting(public, "dev.test", ca.der()).await);
+    let dev_der = presented_cert(public, "dev.test").await;
+    assert!(echoes_trusting(public, "dev.test", &dev_der.into()).await);
+
+    // The cert file of an entry wins over the issuers
     assert_eq!(presented_cert(public, "own.test").await, own_der);
 
     server.shutdown().await;

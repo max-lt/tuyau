@@ -1,8 +1,8 @@
-//! Certs that a local CA issues at the first handshake of each terminated
-//! hostname without a cert of its own. The CA key is on this machine and the
-//! clients trust the CA, so no ACME challenge is needed.
+//! Certs issued at the first handshake of each hostname: signed by a local CA
+//! (its key on this machine, the clients trust it), or self-signed.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,12 +12,10 @@ use rcgen::{
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use time::OffsetDateTime;
 
 use crate::cert;
-use crate::config::LocalCaSection;
 use crate::error::CertError;
 
 /// Validity of an issued cert. macOS refuses a server cert valid for more than
@@ -31,10 +29,15 @@ const BACKDATE: Duration = Duration::from_secs(3600);
 /// client picks the SNI, so it must not grow the cache without end.
 const MAX_ISSUED: usize = 1024;
 
-pub(crate) struct LocalCa {
-    ca: rcgen::Certificate,
-    key: KeyPair,
+pub(crate) struct OnDemand {
+    /// `None` signs each cert with its own key.
+    ca: Option<Box<Ca>>,
     issued: Mutex<HashMap<String, Issued>>,
+}
+
+struct Ca {
+    cert: rcgen::Certificate,
+    key: KeyPair,
 }
 
 struct Issued {
@@ -42,19 +45,27 @@ struct Issued {
     renew_at: OffsetDateTime,
 }
 
-impl std::fmt::Debug for LocalCa {
+impl std::fmt::Debug for OnDemand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalCa")
+        f.debug_struct("OnDemand")
+            .field("local_ca", &self.ca.is_some())
             .field("issued", &self.issued.lock().len())
             .finish_non_exhaustive()
     }
 }
 
-impl LocalCa {
-    pub(crate) fn load(section: &LocalCaSection) -> Result<Self, CertError> {
-        let (chain, key_der) = cert::load_chain(&section.cert_file, &section.key_file)?;
+impl OnDemand {
+    pub(crate) fn self_signed() -> Self {
+        Self {
+            ca: None,
+            issued: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn local_ca(cert_file: &Path, key_file: &Path) -> Result<Self, CertError> {
+        let (chain, key_der) = cert::load_chain(cert_file, key_file)?;
         let key_error =
-            |reason: String| CertError::LocalCaKey(section.key_file.display().to_string(), reason);
+            |reason: String| CertError::IssuerKey(key_file.display().to_string(), reason);
 
         // rcgen on ring reads PKCS#8 keys only
         if !matches!(key_der, PrivateKeyDer::Pkcs8(_)) {
@@ -72,17 +83,16 @@ impl LocalCa {
         let key = KeyPair::try_from(&key_der)?;
         // rcgen signs with a Certificate: this copy keeps the subject and the
         // key identifier of the CA, which the issued certs name as issuer
-        let ca = CertificateParams::from_ca_cert_der(&chain[0])?.self_signed(&key)?;
+        let cert = CertificateParams::from_ca_cert_der(&chain[0])?.self_signed(&key)?;
 
         Ok(Self {
-            ca,
-            key,
+            ca: Some(Box::new(Ca { cert, key })),
             issued: Mutex::new(HashMap::new()),
         })
     }
 
     /// The cert of `host`, issued now if it has none or if it nears its end.
-    fn cert_for(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+    pub(crate) fn cert_for(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         let now = OffsetDateTime::now_utc();
         let mut issued = self.issued.lock();
@@ -96,12 +106,12 @@ impl LocalCa {
         let cert = match self.issue(&host, now) {
             Ok(cert) => cert,
             Err(e) => {
-                tracing::error!(host = %host, error = %e, "local_ca: cannot issue a cert");
+                tracing::error!(host = %host, error = %e, "cannot issue a cert");
                 return None;
             }
         };
 
-        tracing::info!(host = %host, "local_ca: issued a cert");
+        tracing::info!(host = %host, local_ca = self.ca.is_some(), "issued a cert");
 
         if issued.len() >= MAX_ISSUED && !issued.contains_key(&host) {
             issued.clear();
@@ -121,12 +131,17 @@ impl LocalCa {
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.use_authority_key_identifier_extension = true;
         params.not_before = now - BACKDATE;
         params.not_after = now + VALIDITY;
 
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-        let cert = params.signed_by(&key, &self.ca, &self.key)?;
+        let cert = match &self.ca {
+            Some(ca) => {
+                params.use_authority_key_identifier_extension = true;
+                params.signed_by(&key, &ca.cert, &ca.key)?
+            }
+            None => params.self_signed(&key)?,
+        };
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)?;
 
@@ -137,23 +152,17 @@ impl LocalCa {
     }
 }
 
-impl ResolvesServerCert for LocalCa {
-    fn resolve(&self, ch: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.cert_for(ch.server_name()?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::PathBuf;
 
     use rustls::client::danger::ServerCertVerifier;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
-    /// Writes a CA cert and its key into `dir`; gives the section and the CA
-    /// cert.
-    fn write_ca(dir: &Path) -> (LocalCaSection, CertificateDer<'static>) {
+    /// Writes a CA cert and its key into `dir`; gives the cert file, the key
+    /// file and the CA cert.
+    fn write_ca(dir: &Path) -> (PathBuf, PathBuf, CertificateDer<'static>) {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
@@ -170,19 +179,17 @@ mod tests {
         });
         let ca = params.self_signed(&key).unwrap();
 
-        let section = LocalCaSection {
-            cert_file: dir.join("ca.pem"),
-            key_file: dir.join("ca.key"),
-        };
-        std::fs::write(&section.cert_file, ca.pem()).unwrap();
-        std::fs::write(&section.key_file, key.serialize_pem()).unwrap();
+        let cert_file = dir.join("ca.pem");
+        let key_file = dir.join("ca.key");
+        std::fs::write(&cert_file, ca.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
 
-        (section, ca.der().clone())
+        (cert_file, key_file, ca.der().clone())
     }
 
-    fn verify(ca: &CertificateDer<'static>, cert: &CertifiedKey, host: &str) {
+    fn verify(root: &CertificateDer<'static>, cert: &CertifiedKey, host: &str) {
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca.clone()).unwrap();
+        roots.add(root.clone()).unwrap();
         let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
             Arc::new(roots),
             Arc::new(rustls::crypto::ring::default_provider()),
@@ -201,11 +208,15 @@ mod tests {
             .unwrap();
     }
 
+    fn local_ca(dir: &Path) -> (OnDemand, CertificateDer<'static>) {
+        let (cert_file, key_file, ca_der) = write_ca(dir);
+        (OnDemand::local_ca(&cert_file, &key_file).unwrap(), ca_der)
+    }
+
     #[test]
     fn each_host_gets_a_cert_that_the_ca_verifies_and_keeps_it() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (section, ca_der) = write_ca(dir.path());
-        let ca = LocalCa::load(&section).unwrap();
+        let (ca, ca_der) = local_ca(dir.path());
 
         let a = ca.cert_for("A.Example.com.").unwrap();
         let b = ca.cert_for("b.example.com").unwrap();
@@ -217,10 +228,27 @@ mod tests {
     }
 
     #[test]
+    fn a_self_signed_cert_names_the_host_and_has_no_issuer_above_it() {
+        let own = OnDemand::self_signed().cert_for("a.example.com").unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(&own.cert[0]).unwrap();
+
+        assert_eq!(parsed.subject(), parsed.issuer());
+        assert_eq!(
+            parsed
+                .subject()
+                .iter_common_name()
+                .next()
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "a.example.com"
+        );
+    }
+
+    #[test]
     fn a_cert_near_its_end_is_issued_again() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (section, _) = write_ca(dir.path());
-        let ca = LocalCa::load(&section).unwrap();
+        let (ca, _) = local_ca(dir.path());
 
         let first = ca.cert_for("a.example.com").unwrap();
         ca.issued.lock().get_mut("a.example.com").unwrap().renew_at = OffsetDateTime::now_utc();
@@ -231,8 +259,7 @@ mod tests {
     #[test]
     fn the_cache_stays_under_its_bound() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (section, _) = write_ca(dir.path());
-        let ca = LocalCa::load(&section).unwrap();
+        let (ca, _) = local_ca(dir.path());
 
         let certified = ca.cert_for("a.example.com").unwrap();
         let renew_at = OffsetDateTime::now_utc() + VALIDITY;
@@ -260,18 +287,13 @@ mod tests {
     #[test]
     fn the_key_of_another_cert_fails_the_load() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (section, _) = write_ca(dir.path());
+        let (cert_file, _, _) = write_ca(dir.path());
         let other = dir.path().join("other.key");
         std::fs::write(&other, KeyPair::generate().unwrap().serialize_pem()).unwrap();
 
-        let section = LocalCaSection {
-            key_file: other,
-            ..section
-        };
-
         assert!(matches!(
-            LocalCa::load(&section),
-            Err(CertError::LocalCaKey(..))
+            OnDemand::local_ca(&cert_file, &other),
+            Err(CertError::IssuerKey(..))
         ));
     }
 }

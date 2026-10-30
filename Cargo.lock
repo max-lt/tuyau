@@ -2171,6 +2171,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tuyau-protocol",
+ "x509-parser",
 ]
 
 [[package]]

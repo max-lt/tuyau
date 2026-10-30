@@ -51,8 +51,8 @@ a local service.
 - **ACME / Let's Encrypt for public certs**: enable an optional `[acme]`
   block in `server.toml` and the server fetches real browser-trusted certs
   via TLS-ALPN-01 — per hostname, on demand, including hostnames added at
-  runtime. Without it, the public listener serves a dev self-signed
-  multi-SAN cert (`curl -k` works; browsers complain).
+  runtime. Without a cert source, the public listener serves a self-signed
+  cert per hostname (`curl -k` works; browsers complain).
 - **Bring your own cert**: when inbound TLS-ALPN-01 can't run (public 443 is
   held by another service, or inbound IPv6 is unreliable for the CA's
   validation), set `tls_cert_file` / `tls_key_file` to serve a cert obtained
@@ -60,12 +60,15 @@ a local service.
   A `[[hostnames]]` or `[[upstreams]]` entry can set the same two keys to
   serve its own cert, e.g. one origin cert per zone; the other hostnames keep
   the server-wide cert.
-- **Local CA**: on a LAN whose clients trust a CA of your own, set
-  `[local_ca]` (`cert_file`, `key_file`). The server signs a cert for each
-  terminated hostname without a cert of its own at its first handshake, also
-  for a hostname provisioned at runtime. A cert lives in memory for 30 days;
-  the server issues it again 10 days before its end. No challenge, no file to
-  renew.
+- **Cert issuers**: list `[[issuers]]` (`local_ca`, `acme`, `imported`,
+  `self_signed`), mark one `default = true`, and name one with `issuer` on a
+  `[[hostnames]]` or `[[upstreams]]` entry; the others take the default. A
+  `local_ca` issuer (a CA of your own that the clients trust) signs a cert
+  for each hostname at its first handshake: no challenge, no file to renew.
+  E.g. `example.com` from Let's Encrypt and `*.home.lan` from the home CA on
+  the same 443. With the `dynamic` feature, `set_issuers` replaces the list at
+  runtime. `[acme]` and `tls_cert_file` stay as the short form of one default
+  issuer.
 - **Client cert check**: `client_ca_file` makes the hosts tuyau terminates
   accept only clients with a cert signed by that CA, e.g. Cloudflare
   Authenticated Origin Pulls, so nobody bypasses the proxy.

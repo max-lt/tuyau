@@ -174,11 +174,12 @@ async fn h2_browser_reaches_h1_backend() {
             tls_mode: TlsMode::Terminated,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         }],
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
@@ -256,11 +257,12 @@ async fn start_terminated_target(
             tls_mode: TlsMode::Terminated,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         }],
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
-        local_ca: None,
+        issuers: vec![],
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();

@@ -93,6 +93,7 @@ mod tests {
             tls_mode: mode,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         }
     }
 
@@ -109,7 +110,7 @@ mod tests {
             max_public_connections: None,
             error_502_file: None,
             client_ca_file: None,
-            local_ca: None,
+            issuers: vec![],
             upstreams: vec![],
         }
     }

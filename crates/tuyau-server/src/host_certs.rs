@@ -56,12 +56,6 @@ impl HostCerts {
             .find_map(|pattern| self.0.get(pattern))
     }
 
-    /// Whether `host` has its own cert, so ACME and the self-signed cert can
-    /// leave it out.
-    pub(crate) fn covers(&self, host: &str) -> bool {
-        self.select(host).is_some()
-    }
-
     /// A resolver that serves these certs and asks `default` for the other
     /// hostnames.
     pub(crate) fn resolver(
@@ -169,8 +163,8 @@ mod tests {
 
         assert!(Arc::ptr_eq(a, certs.select("www.a.example.com").unwrap()));
         assert_ne!(a.cert[0], b.cert[0]);
-        assert!(!certs.covers("default.example.net"));
-        assert!(!certs.covers("c.example.com"));
+        assert!(!certs.select("default.example.net").is_some());
+        assert!(!certs.select("c.example.com").is_some());
     }
 
     #[test]

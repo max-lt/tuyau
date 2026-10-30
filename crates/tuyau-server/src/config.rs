@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub use tuyau_protocol::TlsMode;
 
@@ -58,32 +58,59 @@ pub struct ServerConfig {
     /// challenge passes without a client cert.
     #[serde(default)]
     pub client_ca_file: Option<PathBuf>,
-    /// Optional local CA (see [`LocalCaSection`]). When set, the public
-    /// listener issues a cert signed by this CA for each terminated hostname
-    /// without a cert of its own, at its first handshake. Excludes `acme` and
-    /// `tls_cert_file`.
+    /// The cert sources of the terminated hostnames. A `[[hostnames]]` or
+    /// `[[upstreams]]` entry names one with `issuer`; the others take the one
+    /// with `default = true`, else a self-signed cert. Excludes `acme` and
+    /// `tls_cert_file`, which stay as a short form of one default issuer.
     #[serde(default)]
-    pub local_ca: Option<LocalCaSection>,
+    pub issuers: Vec<IssuerEntry>,
 }
 
-/// A CA whose key is on this machine, e.g. a home network CA that the clients
-/// trust. The server signs the cert of each terminated hostname with it, so
-/// no ACME challenge is needed. An issued cert lives in memory for 30 days and
-/// the server issues it again 10 days before its end.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LocalCaSection {
-    /// PEM cert of the CA.
-    pub cert_file: PathBuf,
-    /// PEM key of the CA, in PKCS#8 (`BEGIN PRIVATE KEY`). Convert a SEC1 key
-    /// (`BEGIN EC PRIVATE KEY`) with `openssl pkcs8 -topk8 -nocrypt`.
-    pub key_file: PathBuf,
+/// A hostname that the server terminates TLS for, given through the dynamic
+/// seam, and the issuer of its cert (`None` takes the default issuer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminatedHost {
+    pub host: String,
+    pub issuer: Option<String>,
+}
+
+/// A named cert source.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IssuerEntry {
+    pub name: String,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(flatten)]
+    pub kind: IssuerKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IssuerKind {
+    /// A CA whose key is on this machine and that the clients trust. The
+    /// server signs a cert for each hostname at its first handshake. The key
+    /// is PKCS#8 (`BEGIN PRIVATE KEY`): convert a SEC1 key with
+    /// `openssl pkcs8 -topk8 -nocrypt`.
+    LocalCa {
+        cert_file: PathBuf,
+        key_file: PathBuf,
+    },
+    /// Let's Encrypt via TLS-ALPN-01, for names, not `*` patterns.
+    Acme(AcmeSection),
+    /// A PEM chain and its key obtained elsewhere (DNS-01, an origin cert).
+    Imported {
+        cert_file: PathBuf,
+        key_file: PathBuf,
+    },
+    /// A self-signed cert per hostname, issued at its first handshake.
+    SelfSigned,
 }
 
 /// ACME / Let's Encrypt parameters. The default `directory_url` points at LE
 /// **staging** (rate-limit-friendly, untrusted certs) — flip `production` to
 /// true for real Let's Encrypt certs. `contact` is the email the CA notifies
 /// for expiry / policy issues.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct AcmeSection {
     /// `mailto:` URL the CA contacts on issues.
     pub contact: String,
@@ -134,6 +161,9 @@ pub struct HostnameEntry {
     pub tls_cert_file: Option<PathBuf>,
     #[serde(default)]
     pub tls_key_file: Option<PathBuf>,
+    /// Name of the issuer of its cert; `None` takes the default issuer.
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 /// A static local upstream: a hostname served by forwarding to a local address
@@ -170,6 +200,9 @@ pub struct UpstreamEntry {
     pub tls_cert_file: Option<PathBuf>,
     #[serde(default)]
     pub tls_key_file: Option<PathBuf>,
+    /// Name of the issuer of its cert, as in [`HostnameEntry`].
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 impl ServerConfig {
@@ -222,7 +255,7 @@ impl ServerConfig {
         }
 
         self.validate_acme()?;
-        self.validate_local_ca()
+        self.validate_issuers()
     }
 
     /// Validation for dynamic mode (`dynamic` feature): the routing backend
@@ -242,7 +275,7 @@ impl ServerConfig {
         self.validate_host_patterns()?;
         self.validate_host_certs()?;
         self.validate_acme()?;
-        self.validate_local_ca()
+        self.validate_issuers()
     }
 
     /// Each upstream must name exactly one target: a TCP `local_addr` or a Unix
@@ -327,23 +360,117 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// A local CA is the server-wide cert source: it cannot share the role
-    /// with ACME or a server-wide cert file.
-    fn validate_local_ca(&self) -> Result<(), ConfigError> {
-        if self.local_ca.is_none() {
-            return Ok(());
+    /// The issuers in force: `issuers`, else one default issuer for `acme` or
+    /// `tls_cert_file`, else none (a self-signed cert per hostname).
+    pub fn effective_issuers(&self) -> Vec<IssuerEntry> {
+        if !self.issuers.is_empty() {
+            return self.issuers.clone();
         }
 
-        if self.acme.is_some() {
-            return Err(ConfigError::LocalCaWith("acme"));
+        if let Some(acme) = &self.acme {
+            return vec![IssuerEntry {
+                name: "acme".into(),
+                default: true,
+                kind: IssuerKind::Acme(acme.clone()),
+            }];
         }
 
-        if self.tls_cert_file.is_some() || self.tls_key_file.is_some() {
-            return Err(ConfigError::LocalCaWith("tls_cert_file"));
+        if let (Some(cert_file), Some(key_file)) = (&self.tls_cert_file, &self.tls_key_file) {
+            return vec![IssuerEntry {
+                name: "tls_cert_file".into(),
+                default: true,
+                kind: IssuerKind::Imported {
+                    cert_file: cert_file.clone(),
+                    key_file: key_file.clone(),
+                },
+            }];
+        }
+
+        Vec::new()
+    }
+
+    /// The (host, mode, own cert, issuer) of each entry that names an issuer.
+    pub(crate) fn host_issuers(&self) -> impl Iterator<Item = (&str, TlsMode, bool, &str)> {
+        let hostnames = self.hostnames.iter().filter_map(|h| {
+            let issuer = h.issuer.as_deref()?;
+            Some((
+                h.host.as_str(),
+                h.tls_mode,
+                h.tls_cert_file.is_some(),
+                issuer,
+            ))
+        });
+        let upstreams = self.upstreams.iter().filter_map(|u| {
+            let issuer = u.issuer.as_deref()?;
+            Some((
+                u.host.as_str(),
+                u.tls_mode,
+                u.tls_cert_file.is_some(),
+                issuer,
+            ))
+        });
+
+        hostnames.chain(upstreams)
+    }
+
+    fn validate_issuers(&self) -> Result<(), ConfigError> {
+        let legacy =
+            self.acme.is_some() || self.tls_cert_file.is_some() || self.tls_key_file.is_some();
+
+        if !self.issuers.is_empty() && legacy {
+            return Err(ConfigError::IssuersWithLegacy);
+        }
+
+        validate_issuer_list(&self.issuers)?;
+        let issuers = self.effective_issuers();
+
+        for (host, mode, own_cert, name) in self.host_issuers() {
+            if mode == TlsMode::Passthrough {
+                return Err(ConfigError::IssuerPassthrough(host.to_string()));
+            }
+
+            if own_cert {
+                return Err(ConfigError::IssuerWithCert(host.to_string()));
+            }
+
+            let Some(issuer) = issuers.iter().find(|i| i.name == name) else {
+                return Err(ConfigError::UnknownIssuer {
+                    host: host.to_string(),
+                    issuer: name.to_string(),
+                });
+            };
+
+            if host.contains('*') && matches!(issuer.kind, IssuerKind::Acme(_)) {
+                return Err(ConfigError::AcmePattern(host.to_string()));
+            }
         }
 
         Ok(())
     }
+}
+
+/// Names are unique, at most one issuer is the default, and an ACME contact is
+/// a `mailto:` URL.
+pub(crate) fn validate_issuer_list(issuers: &[IssuerEntry]) -> Result<(), ConfigError> {
+    let mut names: HashSet<&str> = HashSet::new();
+
+    for issuer in issuers {
+        if !names.insert(issuer.name.as_str()) {
+            return Err(ConfigError::DuplicateIssuer(issuer.name.clone()));
+        }
+
+        if let IssuerKind::Acme(acme) = &issuer.kind
+            && !acme.contact.starts_with("mailto:")
+        {
+            return Err(ConfigError::AcmeContact(acme.contact.clone()));
+        }
+    }
+
+    if issuers.iter().filter(|i| i.default).count() > 1 {
+        return Err(ConfigError::DefaultIssuers);
+    }
+
+    Ok(())
 }
 
 fn deserialize_token_hex<'de, D>(de: D) -> Result<[u8; 32], D::Error>
@@ -673,26 +800,143 @@ mod tests {
         ));
     }
 
+    const ISSUERS: &str = r#"
+        [[issuers]]
+        name = "home"
+        kind = "local_ca"
+        cert_file = "ca.pem"
+        key_file = "ca.key"
+        default = true
+
+        [[issuers]]
+        name = "le"
+        kind = "acme"
+        contact = "mailto:ops@example.com"
+        cache_dir = "/tmp/acme"
+
+        [[issuers]]
+        name = "origin"
+        kind = "imported"
+        cert_file = "o.pem"
+        key_file = "o.key"
+
+        [[issuers]]
+        name = "dev"
+        kind = "self_signed"
+    "#;
+
+    /// A config with the four issuers and one upstream with `entry` lines.
+    fn with_issuers(top: &str, host: &str, entry: &str) -> Result<ServerConfig, ConfigError> {
+        let toml = format!(
+            "listen_addr = \"0.0.0.0:4433\"\n{top}\n{ISSUERS}\n\
+             [[upstreams]]\nhost = \"{host}\"\nlocal_addr = \"127.0.0.1:1\"\n{entry}\n"
+        );
+        let config = ServerConfig::from_toml_str(&toml)?;
+        config.validate()?;
+        Ok(config)
+    }
+
     #[test]
-    fn a_local_ca_excludes_acme_and_a_server_wide_cert() {
-        let config = |extra: &str| {
-            let toml = format!(
-                "listen_addr = \"0.0.0.0:4433\"\n{extra}\n\
-                 [[upstreams]]\nhost = \"a.example.com\"\nlocal_addr = \"127.0.0.1:1\"\n\
-                 [local_ca]\ncert_file = \"ca.pem\"\nkey_file = \"ca.key\"\n"
-            );
-            ServerConfig::from_toml_str(&toml).unwrap().validate()
+    fn parses_the_four_issuer_kinds() {
+        let config = with_issuers("", "a.example.com", "issuer = \"le\"").unwrap();
+
+        assert_eq!(config.issuers.len(), 4);
+        assert!(config.issuers[0].default);
+        assert!(matches!(config.issuers[1].kind, IssuerKind::Acme(_)));
+        assert_eq!(config.issuers[3].kind, IssuerKind::SelfSigned);
+        assert_eq!(config.upstreams[0].issuer.as_deref(), Some("le"));
+    }
+
+    #[test]
+    fn an_entry_names_a_known_issuer_in_a_mode_and_a_form_that_take_it() {
+        assert!(matches!(
+            with_issuers("", "a.example.com", "issuer = \"nope\""),
+            Err(ConfigError::UnknownIssuer { issuer, .. }) if issuer == "nope"
+        ));
+        assert!(matches!(
+            with_issuers(
+                "",
+                "a.example.com",
+                "tls_mode = \"passthrough\"\nissuer = \"home\""
+            ),
+            Err(ConfigError::IssuerPassthrough(_))
+        ));
+        assert!(matches!(
+            with_issuers(
+                "",
+                "a.example.com",
+                "issuer = \"home\"\ntls_cert_file = \"a.crt\"\ntls_key_file = \"a.key\""
+            ),
+            Err(ConfigError::IssuerWithCert(_))
+        ));
+        assert!(matches!(
+            with_issuers("", "*.example.com", "issuer = \"le\""),
+            Err(ConfigError::AcmePattern(_))
+        ));
+        assert!(with_issuers("", "*.example.com", "issuer = \"home\"").is_ok());
+    }
+
+    #[test]
+    fn issuers_exclude_their_short_form() {
+        assert!(matches!(
+            with_issuers(
+                "tls_cert_file = \"a.crt\"\ntls_key_file = \"a.key\"",
+                "a.example.com",
+                ""
+            ),
+            Err(ConfigError::IssuersWithLegacy)
+        ));
+    }
+
+    #[test]
+    fn issuer_names_are_unique_and_one_at_most_is_the_default() {
+        let issuer = |name: &str, default: bool| IssuerEntry {
+            name: name.into(),
+            default,
+            kind: IssuerKind::SelfSigned,
         };
 
-        assert!(config("").is_ok());
+        assert!(validate_issuer_list(&[issuer("a", true), issuer("b", false)]).is_ok());
         assert!(matches!(
-            config("tls_cert_file = \"a.crt\"\ntls_key_file = \"a.key\""),
-            Err(ConfigError::LocalCaWith("tls_cert_file"))
+            validate_issuer_list(&[issuer("a", false), issuer("a", false)]),
+            Err(ConfigError::DuplicateIssuer(_))
         ));
         assert!(matches!(
-            config("[acme]\ncontact = \"mailto:ops@example.com\"\ncache_dir = \"/tmp/a\""),
-            Err(ConfigError::LocalCaWith("acme"))
+            validate_issuer_list(&[issuer("a", true), issuer("b", true)]),
+            Err(ConfigError::DefaultIssuers)
         ));
+    }
+
+    #[test]
+    fn acme_and_tls_cert_file_are_a_default_issuer() {
+        let config = |top: &str| {
+            let toml = format!(
+                "listen_addr = \"0.0.0.0:4433\"\n{top}\n\
+                 [[upstreams]]\nhost = \"a.example.com\"\nlocal_addr = \"127.0.0.1:1\"\n"
+            );
+            ServerConfig::from_toml_str(&toml).unwrap()
+        };
+
+        let acme = config("[acme]\ncontact = \"mailto:ops@example.com\"\ncache_dir = \"/tmp/a\"");
+        let file = config("tls_cert_file = \"a.crt\"\ntls_key_file = \"a.key\"");
+
+        assert!(matches!(
+            acme.effective_issuers()[..],
+            [IssuerEntry {
+                default: true,
+                kind: IssuerKind::Acme(_),
+                ..
+            }]
+        ));
+        assert!(matches!(
+            file.effective_issuers()[..],
+            [IssuerEntry {
+                default: true,
+                kind: IssuerKind::Imported { .. },
+                ..
+            }]
+        ));
+        assert!(config("").effective_issuers().is_empty());
     }
 
     #[test]

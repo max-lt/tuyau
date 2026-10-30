@@ -138,11 +138,10 @@ pub(crate) struct PublicTls {
 impl PublicTls {
     pub(crate) fn new(
         cert_resolver: Arc<dyn ResolvesServerCert>,
-        acme_active: bool,
         client_cert: ClientCert,
     ) -> Result<Self, ServerError> {
         let needs_client_cert = matches!(client_cert, ClientCert::SignedBy(_));
-        let config = build_rustls_config(cert_resolver, acme_active, client_cert)?;
+        let config = build_rustls_config(cert_resolver, client_cert)?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -176,7 +175,6 @@ pub(crate) async fn start(
 
 fn build_rustls_config(
     cert_resolver: Arc<dyn ResolvesServerCert>,
-    acme_active: bool,
     client_cert: ClientCert,
 ) -> Result<RustlsServerConfig, ServerError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -205,14 +203,13 @@ fn build_rustls_config(
     // h2/http/1.1, so they always match.
     config.alpn_protocols.push(b"h2".to_vec());
     config.alpn_protocols.push(b"http/1.1".to_vec());
-    if acme_active {
-        // Then `acme-tls/1` so Let's Encrypt's validator picks it during
-        // TLS-ALPN-01 challenges and rustls-acme's resolver can answer. ACME
-        // validators offer only this, so ordering never collides with browsers.
-        config
-            .alpn_protocols
-            .push(rustls_acme::acme::ACME_TLS_ALPN_NAME.to_vec());
-    }
+    // Then `acme-tls/1` so Let's Encrypt's validator picks it during
+    // TLS-ALPN-01 challenges and rustls-acme's resolver can answer. An ACME
+    // issuer can be set at runtime, so it is always on. ACME validators offer
+    // only this, so ordering never collides with browsers.
+    config
+        .alpn_protocols
+        .push(rustls_acme::acme::ACME_TLS_ALPN_NAME.to_vec());
     Ok(config)
 }
 

@@ -59,8 +59,26 @@ pub enum ConfigError {
     #[error("host '{0}' is not a name, and an upstream host is not a name, '*.name' or '*'")]
     HostPattern(String),
 
-    #[error("local_ca cannot be set with {0}: both give the server-wide cert")]
-    LocalCaWith(&'static str),
+    #[error("issuers cannot be set with acme or tls_cert_file, their short form")]
+    IssuersWithLegacy,
+
+    #[error("duplicate issuer name: {0}")]
+    DuplicateIssuer(String),
+
+    #[error("more than one issuer sets default = true")]
+    DefaultIssuers,
+
+    #[error("hostname '{host}' references unknown issuer '{issuer}'")]
+    UnknownIssuer { host: String, issuer: String },
+
+    #[error("'{0}' names an issuer in passthrough mode, where the server holds no cert")]
+    IssuerPassthrough(String),
+
+    #[error("'{0}' sets both a cert file and an issuer")]
+    IssuerWithCert(String),
+
+    #[error("'{0}' is a pattern, and ACME issues certs for names only")]
+    AcmePattern(String),
 }
 
 #[derive(Debug, Error)]
@@ -80,8 +98,8 @@ pub enum CertError {
     #[error("pem: no private key found in {0}")]
     PemNoKey(String),
 
-    #[error("local_ca: key {0}: {1}")]
-    LocalCaKey(String, String),
+    #[error("issuer key {0}: {1}")]
+    IssuerKey(String, String),
 
     #[error("tls: {0}")]
     Tls(#[from] rustls::Error),

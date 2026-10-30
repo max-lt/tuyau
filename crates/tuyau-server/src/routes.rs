@@ -215,6 +215,11 @@ impl RoutingTable {
 
     /// Replace the whole terminated set. The caller (the dynamic seam) passes the
     /// full set it knows (config-terminated ∪ backend-provisioned terminated).
+    /// The hostnames the server terminates TLS for (config and dynamic seam).
+    pub fn terminated_hosts(&self) -> Vec<String> {
+        self.terminated.read().iter().cloned().collect()
+    }
+
     #[cfg(feature = "dynamic")]
     pub fn set_terminated(&self, full: Vec<String>) {
         let mut g = self.terminated.write();
@@ -393,6 +398,7 @@ mod tests {
             tls_mode,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         }
     }
 
@@ -449,6 +455,7 @@ mod tests {
             tls_mode: TlsMode::Passthrough,
             tls_cert_file: None,
             tls_key_file: None,
+            issuer: None,
         };
         let table = RoutingTable::from_config(
             &[tunnel],
