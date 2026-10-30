@@ -26,6 +26,7 @@ use crate::config::{AcmeSection, ServerConfig, TlsMode};
 use crate::control::{Control, TunnelInfo};
 use crate::error::ServerError;
 use crate::host_certs::HostCerts;
+use crate::local_ca::LocalCa;
 use crate::public;
 use crate::routes::RoutingTable;
 
@@ -136,9 +137,7 @@ impl TunnelServer {
                     .collect();
 
                 let (resolver, acme) = build_cert_resolver(
-                    &config.acme,
-                    &config.tls_cert_file,
-                    &config.tls_key_file,
+                    &config,
                     &terminated_hostnames,
                     &shared_hostnames,
                     &cert_dir,
@@ -323,20 +322,19 @@ type ResolverBundle = (Arc<dyn ResolvesServerCert>, Option<AcmeController>);
 
 /// Build the cert resolver the public listener should use: rustls-acme's
 /// dynamic resolver if `[acme]` is configured (with a background renewal
-/// task), or a static resolver over a fresh self-signed multi-SAN cert
-/// otherwise. `terminated_hostnames` are all the terminated config hosts;
+/// task), the local CA if `[local_ca]` is, the `tls_cert_file` cert, or a
+/// static resolver over a fresh self-signed multi-SAN cert otherwise.
+/// `terminated_hostnames` are all the terminated config hosts;
 /// `shared_hostnames` are those without a cert of their own, the only ones
 /// the server-wide cert covers.
 fn build_cert_resolver(
-    acme: &Option<AcmeSection>,
-    tls_cert_file: &Option<std::path::PathBuf>,
-    tls_key_file: &Option<std::path::PathBuf>,
+    config: &ServerConfig,
     terminated_hostnames: &[String],
     shared_hostnames: &[String],
     cert_dir: &std::path::Path,
     cancel: CancellationToken,
 ) -> Result<ResolverBundle, ServerError> {
-    if let Some(acme_cfg) = acme {
+    if let Some(acme_cfg) = &config.acme {
         if terminated_hostnames.is_empty() {
             tracing::warn!(
                 "[acme] configured but no terminated hostnames — falling back to a placeholder self-signed cert (passthrough-only deployment?)"
@@ -370,9 +368,17 @@ fn build_cert_resolver(
             return Ok((multi, Some(controller)));
         }
     }
+
+    // Issues on demand, so a hostname provisioned later needs no controller
+    if let Some(section) = &config.local_ca {
+        let ca = LocalCa::load(section)?;
+        tracing::info!(cert = %section.cert_file.display(), "issuing TLS certs from local CA");
+        return Ok((Arc::new(ca), None));
+    }
+
     // Static cert (e.g. obtained out-of-band via DNS-01). Takes precedence over
     // the self-signed fallback when both cert and key paths are configured.
-    if let (Some(cert_file), Some(key_file)) = (tls_cert_file, tls_key_file) {
+    if let (Some(cert_file), Some(key_file)) = (&config.tls_cert_file, &config.tls_key_file) {
         let (chain, key) = cert::load_chain(cert_file, key_file)?;
         tracing::info!(
             cert = %cert_file.display(),
@@ -768,23 +774,16 @@ mod tests {
     #[tokio::test]
     async fn a_host_with_its_own_cert_never_gets_an_acme_order() {
         let dir = tempfile::TempDir::new().unwrap();
-        let acme = Some(AcmeSection {
+        let mut config = ServerConfig::from_toml_str("listen_addr = \"127.0.0.1:0\"").unwrap();
+        config.acme = Some(AcmeSection {
             contact: "mailto:ops@example.com".into(),
             cache_dir: dir.path().join("acme"),
             production: false,
         });
         let own = vec!["own.example.com".to_string()];
 
-        let (_, controller) = build_cert_resolver(
-            &acme,
-            &None,
-            &None,
-            &own,
-            &[],
-            dir.path(),
-            CancellationToken::new(),
-        )
-        .unwrap();
+        let (_, controller) =
+            build_cert_resolver(&config, &own, &[], dir.path(), CancellationToken::new()).unwrap();
 
         let controller = controller.expect("hosts provisioned later still need ACME");
 

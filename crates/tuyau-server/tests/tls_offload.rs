@@ -113,6 +113,7 @@ async fn tls_offload_pipes_plaintext_to_cleartext_backend() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
+        local_ca: None,
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();

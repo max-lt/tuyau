@@ -178,6 +178,7 @@ async fn h2_browser_reaches_h1_backend() {
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
+        local_ca: None,
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();
@@ -259,6 +260,7 @@ async fn start_terminated_target(
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
+        local_ca: None,
     };
     let server = TunnelServer::start(cfg).await.unwrap();
     let public = server.public_local_addr().unwrap();

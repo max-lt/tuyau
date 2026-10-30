@@ -58,6 +58,9 @@ pub enum ConfigError {
 
     #[error("host '{0}' is not a name, and an upstream host is not a name, '*.name' or '*'")]
     HostPattern(String),
+
+    #[error("local_ca cannot be set with {0}: both give the server-wide cert")]
+    LocalCaWith(&'static str),
 }
 
 #[derive(Debug, Error)]
@@ -76,4 +79,10 @@ pub enum CertError {
 
     #[error("pem: no private key found in {0}")]
     PemNoKey(String),
+
+    #[error("local_ca: key {0}: {1}")]
+    LocalCaKey(String, String),
+
+    #[error("tls: {0}")]
+    Tls(#[from] rustls::Error),
 }

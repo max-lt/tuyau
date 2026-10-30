@@ -24,6 +24,7 @@ async fn spin_up_server_with(hostnames: Vec<HostnameEntry>) -> (TunnelServer, Te
         max_public_connections: None,
         error_502_file: None,
         client_ca_file: None,
+        local_ca: None,
         upstreams: vec![],
         clients: vec![ClientEntry {
             name: "service-a".into(),

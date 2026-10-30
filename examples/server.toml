@@ -112,3 +112,13 @@ tls_mode = "passthrough"
 # local_addr = "127.0.0.1:18880"
 # tls_cert_file = "/etc/tuyau/example.org.pem"
 # tls_key_file  = "/etc/tuyau/example.org.key"
+
+# On a LAN whose clients trust a CA of your own, the server signs the cert of
+# each terminated hostname without a cert of its own, at its first handshake.
+# The key must be PKCS#8 ("BEGIN PRIVATE KEY"): convert a SEC1 key with
+# `openssl pkcs8 -topk8 -nocrypt`. Mutually exclusive with [acme] and
+# tls_cert_file.
+#
+# [local_ca]
+# cert_file = "/etc/tuyau/ca.pem"
+# key_file  = "/etc/tuyau/ca.key"

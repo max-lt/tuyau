@@ -7,6 +7,7 @@ mod control;
 mod error;
 mod h2proxy;
 mod host_certs;
+mod local_ca;
 mod local_pool;
 mod meter;
 mod public;
@@ -15,7 +16,8 @@ mod server;
 mod sni;
 
 pub use config::{
-    AcmeSection, Balance, ClientEntry, HostnameEntry, ServerConfig, TlsMode, UpstreamEntry,
+    AcmeSection, Balance, ClientEntry, HostnameEntry, LocalCaSection, ServerConfig, TlsMode,
+    UpstreamEntry,
 };
 pub use error::{CertError, ConfigError, ServerError};
 pub use server::TunnelServer;

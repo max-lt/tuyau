@@ -60,6 +60,12 @@ a local service.
   A `[[hostnames]]` or `[[upstreams]]` entry can set the same two keys to
   serve its own cert, e.g. one origin cert per zone; the other hostnames keep
   the server-wide cert.
+- **Local CA**: on a LAN whose clients trust a CA of your own, set
+  `[local_ca]` (`cert_file`, `key_file`). The server signs a cert for each
+  terminated hostname without a cert of its own at its first handshake, also
+  for a hostname provisioned at runtime. A cert lives in memory for 30 days;
+  the server issues it again 10 days before its end. No challenge, no file to
+  renew.
 - **Client cert check**: `client_ca_file` makes the hosts tuyau terminates
   accept only clients with a cert signed by that CA, e.g. Cloudflare
   Authenticated Origin Pulls, so nobody bypasses the proxy.

@@ -58,6 +58,25 @@ pub struct ServerConfig {
     /// challenge passes without a client cert.
     #[serde(default)]
     pub client_ca_file: Option<PathBuf>,
+    /// Optional local CA (see [`LocalCaSection`]). When set, the public
+    /// listener issues a cert signed by this CA for each terminated hostname
+    /// without a cert of its own, at its first handshake. Excludes `acme` and
+    /// `tls_cert_file`.
+    #[serde(default)]
+    pub local_ca: Option<LocalCaSection>,
+}
+
+/// A CA whose key is on this machine, e.g. a home network CA that the clients
+/// trust. The server signs the cert of each terminated hostname with it, so
+/// no ACME challenge is needed. An issued cert lives in memory for 30 days and
+/// the server issues it again 10 days before its end.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalCaSection {
+    /// PEM cert of the CA.
+    pub cert_file: PathBuf,
+    /// PEM key of the CA, in PKCS#8 (`BEGIN PRIVATE KEY`). Convert a SEC1 key
+    /// (`BEGIN EC PRIVATE KEY`) with `openssl pkcs8 -topk8 -nocrypt`.
+    pub key_file: PathBuf,
 }
 
 /// ACME / Let's Encrypt parameters. The default `directory_url` points at LE
@@ -202,7 +221,8 @@ impl ServerConfig {
             }
         }
 
-        self.validate_acme()
+        self.validate_acme()?;
+        self.validate_local_ca()
     }
 
     /// Validation for dynamic mode (`dynamic` feature): the routing backend
@@ -221,7 +241,8 @@ impl ServerConfig {
         self.validate_upstream_targets()?;
         self.validate_host_patterns()?;
         self.validate_host_certs()?;
-        self.validate_acme()
+        self.validate_acme()?;
+        self.validate_local_ca()
     }
 
     /// Each upstream must name exactly one target: a TCP `local_addr` or a Unix
@@ -303,6 +324,24 @@ impl ServerConfig {
         {
             return Err(ConfigError::AcmeContact(acme.contact.clone()));
         }
+        Ok(())
+    }
+
+    /// A local CA is the server-wide cert source: it cannot share the role
+    /// with ACME or a server-wide cert file.
+    fn validate_local_ca(&self) -> Result<(), ConfigError> {
+        if self.local_ca.is_none() {
+            return Ok(());
+        }
+
+        if self.acme.is_some() {
+            return Err(ConfigError::LocalCaWith("acme"));
+        }
+
+        if self.tls_cert_file.is_some() || self.tls_key_file.is_some() {
+            return Err(ConfigError::LocalCaWith("tls_cert_file"));
+        }
+
         Ok(())
     }
 }
@@ -631,6 +670,28 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::HostCertPair(_))
+        ));
+    }
+
+    #[test]
+    fn a_local_ca_excludes_acme_and_a_server_wide_cert() {
+        let config = |extra: &str| {
+            let toml = format!(
+                "listen_addr = \"0.0.0.0:4433\"\n{extra}\n\
+                 [[upstreams]]\nhost = \"a.example.com\"\nlocal_addr = \"127.0.0.1:1\"\n\
+                 [local_ca]\ncert_file = \"ca.pem\"\nkey_file = \"ca.key\"\n"
+            );
+            ServerConfig::from_toml_str(&toml).unwrap().validate()
+        };
+
+        assert!(config("").is_ok());
+        assert!(matches!(
+            config("tls_cert_file = \"a.crt\"\ntls_key_file = \"a.key\""),
+            Err(ConfigError::LocalCaWith("tls_cert_file"))
+        ));
+        assert!(matches!(
+            config("[acme]\ncontact = \"mailto:ops@example.com\"\ncache_dir = \"/tmp/a\""),
+            Err(ConfigError::LocalCaWith("acme"))
         ));
     }
 

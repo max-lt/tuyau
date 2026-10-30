@@ -109,6 +109,7 @@ mod tests {
             max_public_connections: None,
             error_502_file: None,
             client_ca_file: None,
+            local_ca: None,
             upstreams: vec![],
         }
     }
