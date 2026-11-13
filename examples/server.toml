@@ -125,7 +125,9 @@ tls_mode = "passthrough"
 #   local_ca    a CA of your own that the clients trust; the server signs a
 #               cert for each hostname at its first handshake. The key must be
 #               PKCS#8 ("BEGIN PRIVATE KEY"): convert a SEC1 key with
-#               `openssl pkcs8 -topk8 -nocrypt`.
+#               `openssl pkcs8 -topk8 -nocrypt`. For a CA that is itself
+#               signed, put it and what signed it in cert_file, in that
+#               order; the server sends them after each cert it issues.
 #   acme        Let's Encrypt via TLS-ALPN-01 (contact, cache_dir, production),
 #               for names, not `*` patterns.
 #   imported    a PEM chain and its key obtained elsewhere.

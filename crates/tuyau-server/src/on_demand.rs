@@ -11,7 +11,7 @@ use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use time::OffsetDateTime;
 
@@ -39,6 +39,10 @@ pub(crate) struct OnDemand {
 struct Ca {
     cert: rcgen::Certificate,
     key: KeyPair,
+    /// The CA itself and whatever signed it, sent after each issued cert. An
+    /// intermediate CA is unusable without it: the client trusts the root and
+    /// has no way to fetch what sits in between.
+    chain: Vec<CertificateDer<'static>>,
 }
 
 struct Issued {
@@ -87,7 +91,7 @@ impl OnDemand {
         let cert = CertificateParams::from_ca_cert_der(&chain[0])?.self_signed(&key)?;
 
         Ok(Self {
-            ca: Some(Box::new(Ca { cert, key })),
+            ca: Some(Box::new(Ca { cert, key, chain })),
             issued: Mutex::new(HashMap::new()),
         })
     }
@@ -146,18 +150,22 @@ impl OnDemand {
         params.not_after = now + VALIDITY;
 
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-        let cert = match &self.ca {
+        let chain = match &self.ca {
             Some(ca) => {
                 params.use_authority_key_identifier_extension = true;
-                params.signed_by(&key, &ca.cert, &ca.key)?
+                let cert = params.signed_by(&key, &ca.cert, &ca.key)?;
+                let mut chain = vec![cert.der().clone()];
+                chain.extend(ca.chain.iter().cloned());
+                chain
             }
-            None => params.self_signed(&key)?,
+            None => vec![params.self_signed(&key)?.der().clone()],
         };
+
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)?;
 
         Ok(Issued {
-            certified: Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing_key)),
+            certified: Arc::new(CertifiedKey::new(chain, signing_key)),
             renew_at: now + VALIDITY - RENEW_BEFORE,
         })
     }
@@ -211,7 +219,7 @@ mod tests {
         verifier
             .verify_server_cert(
                 &cert.cert[0],
-                &[],
+                &cert.cert[1..],
                 &ServerName::try_from(host.to_string()).unwrap(),
                 &[],
                 UnixTime::now(),
@@ -306,5 +314,48 @@ mod tests {
             OnDemand::local_ca(&cert_file, &other),
             Err(CertError::IssuerKey(..))
         ));
+    }
+    /// Writes a root, and under it an intermediate CA whose cert file holds
+    /// both; gives the intermediate's cert file, its key file and the root.
+    fn write_intermediate(dir: &Path) -> (PathBuf, PathBuf, CertificateDer<'static>) {
+        let root_key = KeyPair::generate().unwrap();
+        let mut root = CertificateParams::new(Vec::<String>::new()).unwrap();
+        root.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(1));
+        root.distinguished_name
+            .push(DnType::CommonName, "test root");
+        root.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let root = root.self_signed(&root_key).unwrap();
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "test authority");
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName(".example.com".to_string())],
+            excluded_subtrees: vec![],
+        });
+        let intermediate = params.signed_by(&key, &root, &root_key).unwrap();
+
+        let cert_file = dir.join("intermediate.pem");
+        let key_file = dir.join("intermediate.key");
+        std::fs::write(&cert_file, intermediate.pem() + &root.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+
+        (cert_file, key_file, root.der().clone())
+    }
+
+    #[test]
+    fn an_intermediate_sends_its_own_cert_so_the_root_alone_verifies_the_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (cert_file, key_file, root) = write_intermediate(dir.path());
+        let ca = OnDemand::local_ca(&cert_file, &key_file).unwrap();
+
+        let cert = ca.cert_for("a.example.com").unwrap();
+
+        assert_eq!(cert.cert.len(), 3);
+        verify(&root, &cert, "a.example.com");
     }
 }
