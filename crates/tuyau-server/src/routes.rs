@@ -22,11 +22,13 @@ pub struct RouteEntry {
     pub conn: quinn::Connection,
 }
 
-/// The destination of a local upstream: a TCP address or a Unix socket path.
+/// The destination of a local upstream: a TCP address, a Unix socket path, or
+/// the name of an internal listener.
 #[derive(Debug, Clone)]
 pub enum UpstreamTarget {
     Tcp(SocketAddr),
     Unix(PathBuf),
+    Internal(String),
 }
 
 /// Where a hostname's public traffic goes: a client tunnel, or a static local
@@ -163,10 +165,11 @@ fn config_routes(
     let local = upstreams
         .iter()
         .filter_map(|u| {
-            let target = match (&u.local_socket, u.local_addr) {
-                (Some(path), _) => UpstreamTarget::Unix(path.clone()),
-                (None, Some(addr)) => UpstreamTarget::Tcp(addr),
-                (None, None) => return None,
+            let target = match (&u.local_socket, u.local_addr, &u.internal_listener) {
+                (Some(path), _, _) => UpstreamTarget::Unix(path.clone()),
+                (None, Some(addr), _) => UpstreamTarget::Tcp(addr),
+                (None, None, Some(name)) => UpstreamTarget::Internal(name.clone()),
+                (None, None, None) => return None,
             };
             let upstream = LocalUpstream {
                 target,
@@ -454,6 +457,7 @@ mod tests {
             host: host.into(),
             local_addr: Some(SocketAddr::from(([127, 0, 0, 1], port))),
             local_socket: None,
+            internal_listener: None,
             tls_mode,
             tls_cert_file: None,
             tls_key_file: None,

@@ -25,6 +25,9 @@ pub enum ServerError {
 
     #[error("protocol: {0}")]
     Protocol(#[from] tuyau_protocol::ProtocolError),
+
+    #[error("internal listener '{0}' is taken")]
+    InternalListenerTaken(String),
 }
 
 #[derive(Debug, Error)]
@@ -47,8 +50,11 @@ pub enum ConfigError {
     #[error("acme.contact must be a mailto: URL, got '{0}'")]
     AcmeContact(String),
 
-    #[error("upstream '{0}' must set exactly one of local_addr / local_socket")]
+    #[error("upstream '{0}' must set exactly one of local_addr / local_socket / internal_listener")]
     UpstreamTarget(String),
+
+    #[error("upstream '{0}' sets internal_listener, which needs a program that embeds the server")]
+    InternalListenerStatic(String),
 
     #[error("'{0}' must set both tls_cert_file and tls_key_file, or neither")]
     HostCertPair(String),

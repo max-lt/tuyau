@@ -51,8 +51,9 @@ tls_mode = "passthrough"
 
 # Static local upstreams: serve a hostname by forwarding to a local address
 # instead of a client tunnel. Lets tuyau sit on :443 and front existing local
-# services. Each upstream names exactly one target — a TCP `local_addr` OR a Unix
-# `local_socket`. `passthrough` forwards the raw TLS (tuyau never sees plaintext;
+# services. Each upstream names exactly one target: a TCP `local_addr`, a Unix
+# `local_socket`, or an `internal_listener` (only for a program that embeds the
+# server and takes that listener). `passthrough` forwards the raw TLS (tuyau never sees plaintext;
 # the upstream terminates its own TLS); `terminated` has tuyau terminate TLS (it
 # needs a cert for the host) and forward plaintext. Upstreams win over tunnel
 # routes for the same host, so a client can't hijack one. A server may run with

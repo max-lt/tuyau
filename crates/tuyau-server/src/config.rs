@@ -185,14 +185,17 @@ pub struct HostnameEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamEntry {
     pub host: String,
-    /// Forward to a local TCP address. Exactly one of `local_addr` /
-    /// `local_socket` must be set.
+    /// Forward to a local TCP address. Exactly one of `local_addr`,
+    /// `local_socket` and `internal_listener` must be set.
     #[serde(default)]
     pub local_addr: Option<SocketAddr>,
     /// Forward to a local Unix domain socket (e.g. `/run/tuyau/app.sock`).
-    /// Exactly one of `local_addr` / `local_socket` must be set.
     #[serde(default)]
     pub local_socket: Option<PathBuf>,
+    /// Forward to the [`InternalListener`](crate::InternalListener) of this
+    /// name, in the same process. Only with [`TunnelServer::start_with`](crate::TunnelServer).
+    #[serde(default)]
+    pub internal_listener: Option<String>,
     #[serde(default)]
     pub tls_mode: TlsMode,
     /// Optional cert of this hostname, as in [`HostnameEntry`].
@@ -241,6 +244,13 @@ impl ServerConfig {
             }
         }
         self.validate_upstream_targets()?;
+        if let Some(u) = self
+            .upstreams
+            .iter()
+            .find(|u| u.internal_listener.is_some())
+        {
+            return Err(ConfigError::InternalListenerStatic(u.host.clone()));
+        }
         self.validate_host_patterns()?;
         self.validate_host_certs()?;
 
@@ -278,11 +288,15 @@ impl ServerConfig {
         self.validate_issuers(IssuerNames::SetLater)
     }
 
-    /// Each upstream must name exactly one target: a TCP `local_addr` or a Unix
-    /// `local_socket`, never both and never neither.
+    /// Each upstream names exactly one target.
     fn validate_upstream_targets(&self) -> Result<(), ConfigError> {
         for u in &self.upstreams {
-            if u.local_addr.is_some() == u.local_socket.is_some() {
+            let targets = [
+                u.local_addr.is_some(),
+                u.local_socket.is_some(),
+                u.internal_listener.is_some(),
+            ];
+            if targets.into_iter().filter(|set| *set).count() != 1 {
                 return Err(ConfigError::UpstreamTarget(u.host.clone()));
             }
         }

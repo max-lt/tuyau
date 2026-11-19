@@ -15,6 +15,7 @@ use hyper_util::client::legacy::{Client, Error};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::UnixStream;
 
+use crate::internal::Internal;
 use crate::public::UPSTREAM_CONNECT_TIMEOUT;
 use crate::routes::UpstreamTarget;
 
@@ -29,10 +30,11 @@ const MAX_IDLE_PER_BACKEND: usize = 64;
 pub(crate) struct LocalPool {
     tcp: Client<HttpConnector, Incoming>,
     unix: Client<UnixConnector, Incoming>,
+    internal: Internal,
 }
 
 impl LocalPool {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(internal: Internal) -> Self {
         let mut builder = Client::builder(TokioExecutor::new());
         builder
             .pool_timer(TokioTimer::new())
@@ -48,7 +50,12 @@ impl LocalPool {
         Self {
             tcp: builder.build(tcp),
             unix: builder.build(UnixConnector),
+            internal,
         }
+    }
+
+    pub(crate) fn internal(&self) -> &Internal {
+        &self.internal
     }
 
     /// Sends `req`, an origin-form h1 request with its Host, to `target`.
@@ -62,6 +69,9 @@ impl LocalPool {
         let authority = match target {
             UpstreamTarget::Tcp(addr) => addr.to_string(),
             UpstreamTarget::Unix(path) => hex_encode(path.as_os_str().as_encoded_bytes()),
+            UpstreamTarget::Internal(_) => {
+                unreachable!("an internal listener takes one connection per request")
+            }
         };
         let path = req.uri().path_and_query().map_or("/", |path| path.as_str());
         *req.uri_mut() = format!("http://{authority}{path}")
@@ -71,6 +81,7 @@ impl LocalPool {
         match target {
             UpstreamTarget::Tcp(_) => self.tcp.request(req).await,
             UpstreamTarget::Unix(_) => self.unix.request(req).await,
+            UpstreamTarget::Internal(_) => unreachable!(),
         }
     }
 }

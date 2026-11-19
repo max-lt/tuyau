@@ -127,6 +127,7 @@ fn upstream(host: &str, backend: std::net::SocketAddr) -> UpstreamEntry {
         host: host.into(),
         local_addr: Some(backend),
         local_socket: None,
+        internal_listener: None,
         tls_mode: TlsMode::TlsOffload,
         tls_cert_file: None,
         tls_key_file: None,

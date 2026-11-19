@@ -2237,6 +2237,7 @@ name = "tuyau-server"
 version = "0.7.1"
 dependencies = [
  "async-trait",
+ "axum",
  "futures-util",
  "hex",
  "http-body-util",

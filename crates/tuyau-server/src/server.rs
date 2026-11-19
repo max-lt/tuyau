@@ -20,6 +20,9 @@ use crate::config::{IssuerEntry, TerminatedHost};
 use crate::control::{Control, TunnelInfo};
 use crate::error::ServerError;
 use crate::host_certs::{HostCertResolver, HostCerts};
+use crate::internal::Internal;
+#[cfg(feature = "dynamic")]
+use crate::internal::InternalListener;
 #[cfg(feature = "dynamic")]
 use crate::issuers::HostIssuer;
 use crate::issuers::{self, Issuers};
@@ -65,6 +68,7 @@ pub struct TunnelServer {
     host_certs: Option<Arc<HostCertResolver>>,
     mode: Mode,
     fixed: Fixed,
+    internal: Internal,
 }
 
 /// Where the clients and hostnames of the tunnels come from.
@@ -222,6 +226,7 @@ impl TunnelServer {
 
         let cancel = CancellationToken::new();
         let routes = RoutingTable::from_config(&config.hostnames, &config.upstreams);
+        let internal = Internal::default();
 
         // Optional public listener, only spawned if configured. A host with a
         // cert file serves it; the others take the cert of their issuer.
@@ -259,6 +264,7 @@ impl TunnelServer {
                     addr,
                     tls,
                     routes.clone(),
+                    internal.clone(),
                     max_conns,
                     error_502,
                     cancel.clone(),
@@ -313,7 +319,17 @@ impl TunnelServer {
             host_certs,
             mode,
             fixed: Fixed::of(&config),
+            internal,
         })
+    }
+
+    /// The listener of the upstreams with `internal_listener = "<name>"`. A
+    /// name has one listener at a time: dropping it frees the name. A
+    /// connection to a name without a listener gets a 502, as a stopped
+    /// `local_addr` does. Behind the `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn internal_listener(&self, name: &str) -> Result<InternalListener, ServerError> {
+        self.internal.listen(name)
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -437,6 +453,7 @@ impl TunnelServer {
 
     pub async fn shutdown(self) {
         self.cancel.cancel();
+        self.internal.close();
         self.endpoint.close(0u32.into(), b"server shutdown");
         let _ = self.accept_handle.await;
         if let Some(h) = self.public_handle {

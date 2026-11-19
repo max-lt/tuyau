@@ -40,6 +40,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 
+use crate::config::TlsMode;
 use crate::local_pool::LocalPool;
 use crate::public::{connect_tcp, connect_unix, open_tunnel_stream};
 use crate::routes::{Route, RoutingTable, UpstreamTarget};
@@ -215,6 +216,17 @@ async fn proxy(
             let io = tokio::io::join(recv, send);
             Ok(serve_request(io, req, &sni, peer, &error_502).await)
         }
+        // One connection per request, so the listener sees the peer of each
+        Some(Route::Local {
+            target: UpstreamTarget::Internal(name),
+        }) => match pool
+            .internal()
+            .connect(&name, &sni, peer, TlsMode::Terminated)
+            .await
+        {
+            Some(up) => Ok(serve_request(up, req, &sni, peer, &error_502).await),
+            None => Ok(bad_gateway(&error_502)),
+        },
         Some(Route::Local { target, .. }) if !needs_own_connection(&req) => {
             Ok(pooled_roundtrip(&pool, &target, req, &sni, peer, &error_502).await)
         }
@@ -227,6 +239,7 @@ async fn proxy(
                 Some(up) => Ok(serve_request(up, req, &sni, peer, &error_502).await),
                 None => Ok(bad_gateway(&error_502)),
             },
+            UpstreamTarget::Internal(_) => unreachable!("matched above"),
         },
         None => {
             tracing::info!(peer = %peer, sni = %sni, "terminated h2, no live route — serving 502");

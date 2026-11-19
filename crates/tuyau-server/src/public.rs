@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use tuyau_protocol::{DataStreamHeader, FrameCodec};
 
+use crate::config::TlsMode;
 use crate::error::ServerError;
 use crate::meter::{Meter, Metered};
 use crate::routes::{Route, RouteEntry, RoutingTable, UpstreamTarget};
@@ -159,6 +160,7 @@ pub(crate) async fn start(
     listen_addr: SocketAddr,
     tls: PublicTls,
     routes: RoutingTable,
+    internal: crate::internal::Internal,
     max_conns: usize,
     error_502: Arc<str>,
     cancel: CancellationToken,
@@ -167,7 +169,10 @@ pub(crate) async fn start(
     let local_addr = listener.local_addr()?;
 
     let join = tokio::spawn(async move {
-        accept_loop(listener, tls, routes, max_conns, error_502, cancel).await;
+        accept_loop(
+            listener, tls, routes, internal, max_conns, error_502, cancel,
+        )
+        .await;
     });
 
     Ok(PublicListenerHandle { local_addr, join })
@@ -217,6 +222,7 @@ async fn accept_loop(
     listener: TcpListener,
     tls: PublicTls,
     routes: RoutingTable,
+    internal: crate::internal::Internal,
     max_conns: usize,
     error_502: Arc<str>,
     cancel: CancellationToken,
@@ -228,7 +234,7 @@ async fn accept_loop(
     // Plus a per-IP cap so a single source can't hold every global permit and
     // starve the rest (including anything else this server fronts).
     let per_ip = PerIpLimiter::new(max_conns_per_ip(max_conns));
-    let pool = crate::local_pool::LocalPool::new();
+    let pool = crate::local_pool::LocalPool::new(internal);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -424,7 +430,12 @@ where
             }
             Some(Route::Local { target, .. }) => {
                 tracing::info!(peer = %peer, sni = %sni, "public connection routed (terminated, local)");
-                dispatch_local(tls_stream, &target, &sni, peer).await;
+                let mode = if offload {
+                    TlsMode::TlsOffload
+                } else {
+                    TlsMode::Terminated
+                };
+                dispatch_local(tls_stream, &target, &pool, &sni, peer, mode).await;
             }
             None if offload => {
                 // No HTTP semantics on an offload host — a 502 page would be
@@ -449,7 +460,7 @@ where
             }
             Some(Route::Local { target, .. }) => {
                 tracing::info!(peer = %peer, sni = %sni, "public connection routed (passthrough, local)");
-                dispatch_local(prefixed, &target, &sni, peer).await;
+                dispatch_local(prefixed, &target, &pool, &sni, peer, TlsMode::Passthrough).await;
             }
             None => {
                 tracing::warn!(peer = %peer, sni = %sni, "no route for SNI, dropping");
@@ -463,8 +474,14 @@ where
 /// Connect to a local upstream's target and splice the public-side stream to it.
 /// Generic over the public stream so both terminated TLS streams and raw
 /// passthrough streams reuse it.
-async fn dispatch_local<S>(public_stream: S, target: &UpstreamTarget, sni: &str, peer: SocketAddr)
-where
+async fn dispatch_local<S>(
+    public_stream: S,
+    target: &UpstreamTarget,
+    pool: &crate::local_pool::LocalPool,
+    sni: &str,
+    peer: SocketAddr,
+    tls_mode: TlsMode,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match target {
@@ -475,6 +492,11 @@ where
         }
         UpstreamTarget::Unix(path) => {
             if let Some(up) = connect_unix(path, sni, peer).await {
+                splice_local(public_stream, up).await;
+            }
+        }
+        UpstreamTarget::Internal(name) => {
+            if let Some(up) = pool.internal().connect(name, sni, peer, tls_mode).await {
                 splice_local(public_stream, up).await;
             }
         }

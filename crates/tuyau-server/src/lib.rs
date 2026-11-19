@@ -8,6 +8,7 @@ mod coverage;
 mod error;
 mod h2proxy;
 mod host_certs;
+mod internal;
 mod issuers;
 mod local_pool;
 mod meter;
@@ -48,3 +49,8 @@ pub use backend::{ClientGrant, RoutingBackend};
 /// stream). Behind the `dynamic` feature.
 #[cfg(feature = "dynamic")]
 pub use control::{ControlEvent, TunnelInfo};
+
+/// The in-memory listeners of the upstreams with `internal_listener`, taken by
+/// [`TunnelServer::internal_listener`]. Behind the `dynamic` feature.
+#[cfg(feature = "dynamic")]
+pub use internal::{InternalConnection, InternalListener};

@@ -82,6 +82,7 @@ fn upstream(
         host: host.into(),
         local_addr: Some(backend),
         local_socket: None,
+        internal_listener: None,
         tls_mode,
         tls_cert_file: cert.map(|(cert, _)| cert.to_path_buf()),
         tls_key_file: cert.map(|(_, key)| key.to_path_buf()),

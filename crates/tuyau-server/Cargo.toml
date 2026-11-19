@@ -9,6 +9,9 @@ license.workspace = true
 # for embedders such as a managed control plane. Off by default: the self-host
 # binary stays static/config-file only.
 dynamic = []
+# `impl axum::serve::Listener for InternalListener`, to serve an axum app on an
+# internal listener
+axum = ["dynamic", "dep:axum"]
 
 [dependencies]
 tuyau-protocol = { workspace = true }
@@ -37,6 +40,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
 tower-service = { workspace = true }
 http-body-util = { workspace = true }
+axum = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
