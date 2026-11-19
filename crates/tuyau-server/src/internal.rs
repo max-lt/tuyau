@@ -1,8 +1,12 @@
-//! Internal listeners: an upstream with `internal_listener = "<name>"` reaches
-//! the [`InternalListener`] that the embedding program took under that name,
-//! over an in-memory stream instead of a socket.
+//! Internal upstreams: an upstream with `internal_listener = "<name>"` reaches
+//! the [`InternalUpstream`] that the embedding program set under that name.
+//! The core gives it the facts of each public connection and takes a byte
+//! stream back; where the stream leads is up to the embedder.
+//!
+//! [`InternalListener::channel`] is one such upstream: an in-memory stream to a
+//! listener in the same process.
 
-// Only an embedder takes a listener (`dynamic`); without it, nothing does
+// Only an embedder sets an upstream (`dynamic`); without it, nothing does
 #![cfg_attr(not(feature = "dynamic"), allow(dead_code))]
 
 use std::collections::HashMap;
@@ -10,147 +14,155 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use parking_lot::Mutex;
+use async_trait::async_trait;
+use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
 
 use crate::config::TlsMode;
-use crate::error::ServerError;
 use crate::public::UPSTREAM_CONNECT_TIMEOUT;
 
-/// Bytes in flight each way on one connection before a writer waits.
-const STREAM_BUFFER: usize = 64 * 1024;
-
-/// Connections a listener holds before `accept`, as the backlog of a socket.
-const BACKLOG: usize = 128;
-
-struct Slot {
-    id: u64,
-    sender: mpsc::Sender<InternalConnection>,
+/// What the core knows of a public connection routed to an internal upstream.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct InternalConnect {
+    /// The `internal_listener` of the upstream entry.
+    pub name: String,
+    /// The SNI of the public connection.
+    pub hostname: String,
+    /// The address of the public client.
+    pub peer: SocketAddr,
+    pub tls_mode: TlsMode,
 }
 
-/// The internal listeners of a server, by name.
+/// The byte stream an [`InternalUpstream`] gives back: the plaintext HTTP of a
+/// `terminated` host, the plaintext of a `tls_offload` host, or the raw TLS of
+/// a `passthrough` host.
+pub trait InternalStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> InternalStream for T {}
+
+/// Serves the upstreams with `internal_listener = "<name>"`, set with
+/// [`TunnelServer::set_internal_upstream`](crate::TunnelServer::set_internal_upstream).
+/// An error gets the client a 502, as a stopped `local_addr` does.
+#[async_trait]
+pub trait InternalUpstream: Send + Sync + 'static {
+    async fn open(&self, connect: InternalConnect) -> io::Result<Box<dyn InternalStream>>;
+}
+
+/// The internal upstreams of a server, by name.
 #[derive(Clone, Default)]
 pub(crate) struct Internal {
-    slots: Arc<Mutex<HashMap<String, Slot>>>,
-    next_id: Arc<AtomicU64>,
+    upstreams: Arc<RwLock<HashMap<String, Arc<dyn InternalUpstream>>>>,
 }
 
 impl Internal {
-    pub(crate) fn listen(&self, name: &str) -> Result<InternalListener, ServerError> {
-        let mut slots = self.slots.lock();
-        if slots.contains_key(name) {
-            return Err(ServerError::InternalListenerTaken(name.to_owned()));
-        }
-
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = mpsc::channel(BACKLOG);
-        slots.insert(name.to_owned(), Slot { id, sender });
-
-        Ok(InternalListener {
-            name: name.to_owned(),
-            id,
-            receiver,
-            internal: self.clone(),
-        })
+    pub(crate) fn set(&self, name: &str, upstream: Arc<dyn InternalUpstream>) {
+        self.upstreams.write().insert(name.to_owned(), upstream);
     }
 
-    /// The server side of a new connection to the listener `name`. `None` when
-    /// no listener has that name, or when it does not accept in time (logged).
+    pub(crate) fn remove(&self, name: &str) {
+        self.upstreams.write().remove(name);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.upstreams.write().clear();
+    }
+
+    /// `None` when no upstream has that name, or when it fails or does not
+    /// answer in time (logged).
     pub(crate) async fn connect(
         &self,
         name: &str,
-        sni: &str,
+        hostname: &str,
         peer: SocketAddr,
         tls_mode: TlsMode,
-    ) -> Option<DuplexStream> {
-        let sender = self.slots.lock().get(name).map(|s| s.sender.clone());
-        let Some(sender) = sender else {
-            tracing::warn!(peer = %peer, sni = %sni, listener = name, "no internal listener");
+    ) -> Option<Box<dyn InternalStream>> {
+        let upstream = self.upstreams.read().get(name).cloned();
+        let Some(upstream) = upstream else {
+            tracing::warn!(peer = %peer, sni = %hostname, upstream = name, "no internal upstream");
             return None;
         };
 
-        let (ours, theirs) = tokio::io::duplex(STREAM_BUFFER);
-        let connection = InternalConnection {
-            stream: theirs,
-            hostname: sni.to_owned(),
+        let connect = InternalConnect {
+            name: name.to_owned(),
+            hostname: hostname.to_owned(),
             peer,
             tls_mode,
         };
-        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, sender.send(connection)).await {
-            Ok(Ok(())) => Some(ours),
-            Ok(Err(_)) => {
-                tracing::warn!(peer = %peer, sni = %sni, listener = name, "internal listener closed");
+        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, upstream.open(connect)).await {
+            Ok(Ok(stream)) => Some(stream),
+            Ok(Err(e)) => {
+                tracing::warn!(peer = %peer, sni = %hostname, upstream = name, error = %e, "internal upstream open failed");
                 None
             }
             Err(_) => {
-                tracing::warn!(peer = %peer, sni = %sni, listener = name, "internal listener connect timeout");
+                tracing::warn!(peer = %peer, sni = %hostname, upstream = name, "internal upstream open timeout");
                 None
             }
         }
     }
-
-    /// Ends every listener: `accept` returns `None` once its backlog is empty.
-    pub(crate) fn close(&self) {
-        self.slots.lock().clear();
-    }
 }
 
-/// The connections that the server routes to an upstream with
-/// `internal_listener = "<name>"`. Dropping it frees the name.
+/// Bytes in flight each way on one in-memory connection before a writer waits.
+const STREAM_BUFFER: usize = 64 * 1024;
+
+/// Connections an [`InternalListener`] holds before `accept`, as the backlog
+/// of a socket.
+const BACKLOG: usize = 128;
+
+/// The connections of an [`InMemoryUpstream`], in the same process.
 pub struct InternalListener {
-    name: String,
-    id: u64,
     receiver: mpsc::Receiver<InternalConnection>,
-    internal: Internal,
+}
+
+/// The [`InternalUpstream`] half of [`InternalListener::channel`].
+#[derive(Clone)]
+pub struct InMemoryUpstream {
+    sender: mpsc::Sender<InternalConnection>,
 }
 
 impl InternalListener {
-    pub fn name(&self) -> &str {
-        &self.name
+    /// An upstream to set on the server, and the listener of its connections.
+    /// Once the listener drops, the upstream fails each connection.
+    pub fn channel() -> (InMemoryUpstream, InternalListener) {
+        let (sender, receiver) = mpsc::channel(BACKLOG);
+        (InMemoryUpstream { sender }, InternalListener { receiver })
     }
 
-    /// The next connection. `None` after the server shuts down.
+    /// The next connection. `None` once every [`InMemoryUpstream`] has dropped.
     pub async fn accept(&mut self) -> Option<InternalConnection> {
         self.receiver.recv().await
     }
 }
 
-impl Drop for InternalListener {
-    fn drop(&mut self) {
-        let mut slots = self.internal.slots.lock();
-        if slots.get(&self.name).is_some_and(|s| s.id == self.id) {
-            slots.remove(&self.name);
-        }
+#[async_trait]
+impl InternalUpstream for InMemoryUpstream {
+    async fn open(&self, connect: InternalConnect) -> io::Result<Box<dyn InternalStream>> {
+        let (ours, theirs) = tokio::io::duplex(STREAM_BUFFER);
+        let connection = InternalConnection {
+            stream: theirs,
+            connect,
+        };
+        self.sender
+            .send(connection)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::ConnectionRefused, "listener dropped"))?;
+        Ok(Box::new(ours))
     }
 }
 
-/// One public connection, as a byte stream: the plaintext HTTP of a
-/// `terminated` host, the plaintext of a `tls_offload` host, or the raw TLS of
-/// a `passthrough` host.
+/// One connection of an [`InternalListener`].
 pub struct InternalConnection {
     stream: DuplexStream,
-    hostname: String,
-    peer: SocketAddr,
-    tls_mode: TlsMode,
+    connect: InternalConnect,
 }
 
 impl InternalConnection {
-    /// The SNI of the public connection.
-    pub fn hostname(&self) -> &str {
-        &self.hostname
-    }
-
-    /// The address of the public client.
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.peer
-    }
-
-    pub fn tls_mode(&self) -> TlsMode {
-        self.tls_mode
+    pub fn connect(&self) -> &InternalConnect {
+        &self.connect
     }
 }
 
@@ -199,10 +211,10 @@ impl axum::serve::Listener for InternalListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         match InternalListener::accept(self).await {
             Some(connection) => {
-                let peer = connection.peer;
+                let peer = connection.connect.peer;
                 (connection, peer)
             }
-            // axum retries an accept forever: after shutdown, wait for good
+            // axum retries an accept forever: once the upstream drops, wait for good
             None => std::future::pending().await,
         }
     }
@@ -224,9 +236,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_connection_reaches_the_listener_with_its_peer() {
+    async fn test_a_connection_reaches_the_listener_with_its_facts() {
         let internal = Internal::default();
-        let mut listener = internal.listen("admin").unwrap();
+        let (upstream, mut listener) = InternalListener::channel();
+        internal.set("admin", Arc::new(upstream));
 
         let mut ours = internal
             .connect("admin", "admin.example.com", peer(), TlsMode::Terminated)
@@ -238,27 +251,18 @@ mod tests {
         theirs.read_exact(&mut got).await.unwrap();
 
         assert_eq!(&got, b"ping");
-        assert_eq!(theirs.hostname(), "admin.example.com");
-        assert_eq!(theirs.peer_addr(), peer());
-        assert_eq!(theirs.tls_mode(), TlsMode::Terminated);
+        assert_eq!(theirs.connect().name, "admin");
+        assert_eq!(theirs.connect().hostname, "admin.example.com");
+        assert_eq!(theirs.connect().peer, peer());
+        assert_eq!(theirs.connect().tls_mode, TlsMode::Terminated);
     }
 
     #[tokio::test]
-    async fn test_a_name_is_taken_until_its_listener_drops() {
+    async fn test_an_unknown_or_removed_name_gets_no_stream() {
         let internal = Internal::default();
-        let listener = internal.listen("admin").unwrap();
-
-        assert!(matches!(
-            internal.listen("admin"),
-            Err(ServerError::InternalListenerTaken(_))
-        ));
-        drop(listener);
-        assert!(internal.listen("admin").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_an_unknown_name_gets_no_connection() {
-        let internal = Internal::default();
+        let (upstream, _listener) = InternalListener::channel();
+        internal.set("admin", Arc::new(upstream));
+        internal.remove("admin");
 
         let stream = internal
             .connect("admin", "admin.example.com", peer(), TlsMode::Terminated)
@@ -268,11 +272,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_close_ends_accept() {
+    async fn test_a_dropped_listener_gets_no_stream() {
         let internal = Internal::default();
-        let mut listener = internal.listen("admin").unwrap();
+        let (upstream, listener) = InternalListener::channel();
+        internal.set("admin", Arc::new(upstream));
+        drop(listener);
 
-        internal.close();
+        let stream = internal
+            .connect("admin", "admin.example.com", peer(), TlsMode::Terminated)
+            .await;
+
+        assert!(stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_ends_accept() {
+        let internal = Internal::default();
+        let (upstream, mut listener) = InternalListener::channel();
+        internal.set("admin", Arc::new(upstream));
+
+        internal.clear();
 
         assert!(listener.accept().await.is_none());
     }

@@ -25,9 +25,6 @@ pub enum ServerError {
 
     #[error("protocol: {0}")]
     Protocol(#[from] tuyau_protocol::ProtocolError),
-
-    #[error("internal listener '{0}' is taken")]
-    InternalListenerTaken(String),
 }
 
 #[derive(Debug, Error)]

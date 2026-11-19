@@ -1,5 +1,5 @@
-//! Upstreams with `internal_listener`: the public listener reaches an
-//! `InternalListener` of the embedding program, with no socket between them.
+//! Upstreams with `internal_listener`: the public listener reaches the
+//! `InternalUpstream` that the embedding program set under that name.
 #![cfg(feature = "axum")]
 
 use std::net::SocketAddr;
@@ -18,8 +18,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use tuyau_server::{
-    ClientGrant, ConfigError, RoutingBackend, ServerConfig, ServerError, TlsMode, TunnelServer,
-    UpstreamEntry,
+    ClientGrant, ConfigError, InternalConnect, InternalListener, InternalStream, InternalUpstream,
+    RoutingBackend, ServerConfig, ServerError, TlsMode, TunnelServer, UpstreamEntry,
 };
 
 struct NoClients;
@@ -101,7 +101,8 @@ async fn get_root(public: SocketAddr) -> (u16, String, SocketAddr) {
 async fn test_an_axum_app_on_an_internal_listener_sees_the_public_client() {
     let dir = tempfile::TempDir::new().unwrap();
     let (server, public) = start(&dir, TlsMode::Terminated).await;
-    let listener = server.internal_listener("admin").unwrap();
+    let (upstream, listener) = InternalListener::channel();
+    server.set_internal_upstream("admin", Arc::new(upstream));
     let app = Router::new().route(
         "/",
         get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
@@ -120,9 +121,73 @@ async fn test_an_axum_app_on_an_internal_listener_sees_the_public_client() {
 }
 
 #[tokio::test]
-async fn test_a_name_without_a_listener_gets_a_502() {
+async fn test_a_name_without_an_upstream_gets_a_502() {
     let dir = tempfile::TempDir::new().unwrap();
     let (server, public) = start(&dir, TlsMode::Terminated).await;
+    let (upstream, _listener) = InternalListener::channel();
+    server.set_internal_upstream("admin", Arc::new(upstream));
+    server.remove_internal_upstream("admin");
+
+    let (status, _, _) = get_root(public).await;
+
+    assert_eq!(status, 502);
+
+    server.shutdown().await;
+}
+
+/// Answers each connection with a fixed HTTP response that names the facts it got.
+struct Fixed;
+
+#[tuyau_server::async_trait]
+impl InternalUpstream for Fixed {
+    async fn open(&self, connect: InternalConnect) -> std::io::Result<Box<dyn InternalStream>> {
+        let (ours, mut theirs) = tokio::io::duplex(4096);
+        let body = format!(
+            "{} {} {:?}",
+            connect.name, connect.hostname, connect.tls_mode
+        );
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut request = [0u8; 1024];
+            let _ = theirs.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = theirs.write_all(response.as_bytes()).await;
+        });
+        Ok(Box::new(ours))
+    }
+}
+
+struct Failing;
+
+#[tuyau_server::async_trait]
+impl InternalUpstream for Failing {
+    async fn open(&self, _connect: InternalConnect) -> std::io::Result<Box<dyn InternalStream>> {
+        Err(std::io::Error::other("down"))
+    }
+}
+
+#[tokio::test]
+async fn test_any_upstream_gets_the_facts_of_the_connection() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (server, public) = start(&dir, TlsMode::Terminated).await;
+    server.set_internal_upstream("admin", Arc::new(Fixed));
+
+    let (status, body, _) = get_root(public).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body, "admin admin.example.com Terminated");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_a_failing_upstream_gets_a_502() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (server, public) = start(&dir, TlsMode::Terminated).await;
+    server.set_internal_upstream("admin", Arc::new(Failing));
 
     let (status, _, _) = get_root(public).await;
 
@@ -135,7 +200,8 @@ async fn test_a_name_without_a_listener_gets_a_502() {
 async fn test_a_passthrough_listener_gets_the_raw_client_hello() {
     let dir = tempfile::TempDir::new().unwrap();
     let (server, public) = start(&dir, TlsMode::Passthrough).await;
-    let mut listener = server.internal_listener("admin").unwrap();
+    let (upstream, mut listener) = InternalListener::channel();
+    server.set_internal_upstream("admin", Arc::new(upstream));
 
     // The handshake waits for an answer that never comes; the bytes are enough
     let client = tokio::spawn(async move {
@@ -148,8 +214,8 @@ async fn test_a_passthrough_listener_gets_the_raw_client_hello() {
     connection.read_exact(&mut record_type).await.unwrap();
 
     assert_eq!(record_type[0], 0x16, "a TLS handshake record");
-    assert_eq!(connection.hostname(), "admin.example.com");
-    assert_eq!(connection.tls_mode(), TlsMode::Passthrough);
+    assert_eq!(connection.connect().hostname, "admin.example.com");
+    assert_eq!(connection.connect().tls_mode, TlsMode::Passthrough);
 
     client.abort();
     server.shutdown().await;

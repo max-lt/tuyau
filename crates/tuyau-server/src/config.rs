@@ -192,8 +192,8 @@ pub struct UpstreamEntry {
     /// Forward to a local Unix domain socket (e.g. `/run/tuyau/app.sock`).
     #[serde(default)]
     pub local_socket: Option<PathBuf>,
-    /// Forward to the [`InternalListener`](crate::InternalListener) of this
-    /// name, in the same process. Only with [`TunnelServer::start_with`](crate::TunnelServer).
+    /// Forward to the internal upstream of this name, that the embedding
+    /// program sets. Only with `TunnelServer::start_with` (`dynamic`).
     #[serde(default)]
     pub internal_listener: Option<String>,
     #[serde(default)]

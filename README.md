@@ -43,13 +43,14 @@ a local service.
   feature, swap a `TcpListener` for a `TunnelListener` in one line and serve
   your existing axum/hyper app through the tunnel. CLI is a thin wrapper
   around the library.
-- **Internal listeners**: a program that embeds `tuyau-server` (`dynamic`
-  feature) takes `server.internal_listener("admin")` and serves on it, as on a
-  `TcpListener`. An `[[upstreams]]` entry with `internal_listener = "admin"`
-  reaches it over an in-memory stream: no port and no socket file, in all
-  three TLS modes. Each connection carries the hostname, the TLS mode and the
-  address of the public client. With the `axum` feature, `axum::serve` takes
-  the listener.
+- **Internal upstreams**: an `[[upstreams]]` entry with
+  `internal_listener = "admin"` reaches the `InternalUpstream` that a program
+  embedding `tuyau-server` (`dynamic` feature) sets with
+  `server.set_internal_upstream("admin", ...)`. The server gives it the
+  hostname, the TLS mode and the address of the public client, and takes a
+  byte stream back, in all three TLS modes. The stream can lead anywhere: a
+  listener in the same process (`InternalListener::channel`, which
+  `axum::serve` takes with the `axum` feature), another process, a socket.
 - **Container-native CLI**: client config via flags + `TUYAU_*` env vars,
   token via `--token-file` / `TUYAU_TOKEN_FILE` (Docker secrets), no bare
   hex on the command line. TOML config is opt-in via `--config`.

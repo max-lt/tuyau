@@ -50,7 +50,12 @@ pub use backend::{ClientGrant, RoutingBackend};
 #[cfg(feature = "dynamic")]
 pub use control::{ControlEvent, TunnelInfo};
 
-/// The in-memory listeners of the upstreams with `internal_listener`, taken by
-/// [`TunnelServer::internal_listener`]. Behind the `dynamic` feature.
+/// The upstreams with `internal_listener`, served by the embedder: see
+/// [`InternalUpstream`] and [`TunnelServer::set_internal_upstream`].
+/// [`InternalListener::channel`] serves one in the same process. Behind the
+/// `dynamic` feature.
 #[cfg(feature = "dynamic")]
-pub use internal::{InternalConnection, InternalListener};
+pub use internal::{
+    InMemoryUpstream, InternalConnect, InternalConnection, InternalListener, InternalStream,
+    InternalUpstream,
+};

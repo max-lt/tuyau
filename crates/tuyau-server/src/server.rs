@@ -22,7 +22,7 @@ use crate::error::ServerError;
 use crate::host_certs::{HostCertResolver, HostCerts};
 use crate::internal::Internal;
 #[cfg(feature = "dynamic")]
-use crate::internal::InternalListener;
+use crate::internal::InternalUpstream;
 #[cfg(feature = "dynamic")]
 use crate::issuers::HostIssuer;
 use crate::issuers::{self, Issuers};
@@ -323,13 +323,19 @@ impl TunnelServer {
         })
     }
 
-    /// The listener of the upstreams with `internal_listener = "<name>"`. A
-    /// name has one listener at a time: dropping it frees the name. A
-    /// connection to a name without a listener gets a 502, as a stopped
-    /// `local_addr` does. Behind the `dynamic` feature.
+    /// Serve the upstreams with `internal_listener = "<name>"` with
+    /// `upstream`, in place of the one set before. A connection to a name
+    /// without an upstream gets a 502, as a stopped `local_addr` does. Behind
+    /// the `dynamic` feature.
     #[cfg(feature = "dynamic")]
-    pub fn internal_listener(&self, name: &str) -> Result<InternalListener, ServerError> {
-        self.internal.listen(name)
+    pub fn set_internal_upstream(&self, name: &str, upstream: Arc<dyn InternalUpstream>) {
+        self.internal.set(name, upstream);
+    }
+
+    /// Behind the `dynamic` feature.
+    #[cfg(feature = "dynamic")]
+    pub fn remove_internal_upstream(&self, name: &str) {
+        self.internal.remove(name);
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -453,7 +459,7 @@ impl TunnelServer {
 
     pub async fn shutdown(self) {
         self.cancel.cancel();
-        self.internal.close();
+        self.internal.clear();
         self.endpoint.close(0u32.into(), b"server shutdown");
         let _ = self.accept_handle.await;
         if let Some(h) = self.public_handle {
